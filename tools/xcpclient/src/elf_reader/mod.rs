@@ -595,6 +595,7 @@ impl ElfReader {
         unit_idx_limit: usize,
         name_filter: &str,
         unit_filter: &str,
+        id_addressing: bool,
     ) -> Result<(), Box<dyn Error>> {
         // Load debug information from the ELF file
         info!("===============================================================");
@@ -793,6 +794,14 @@ impl ElfReader {
                     // @@@@ NOTE: This might change in the future
                     (McObjectType::Characteristic, McAddress::new_a2l(seg.addr + offset as u32, 0))
                 } else {
+                    // In identifier addressing every measurement comes from the mci_meas
+                    // descriptor section (register_mci_measurements): drop the DWARF-swept
+                    // absolute/stack measurement here, otherwise we would emit a duplicate under an
+                    // absolute address and also sweep up internal library globals. Calibration
+                    // characteristics (the branch above) still come from DWARF.
+                    if id_addressing {
+                        continue;
+                    }
                     // Create a McAddress with event id, mem_addr is relative or absolute
                     // @@@@ TODO: Not implemented dependency on target addressing scheme
                     // Address extension might be 0, 1, 2 depending on the target addressing scheme
@@ -937,6 +946,212 @@ impl ElfReader {
 
         Ok(())
     }
+
+    /// True when the ELF carries mc-instrument measurement descriptors (the mci_meas section),
+    /// i.e. the target uses identifier addressing for measurements. In that case the DWARF
+    /// measurement sweep in register_variables is suppressed and the measurements are produced by
+    /// register_mci_measurements instead.
+    pub fn has_id_addressing(&self) -> bool {
+        self.debug_data.mci_meas_data.is_some()
+    }
+
+    /// Register identifier-addressed measurements from the mci_meas ELF section.
+    ///
+    /// Each MeasMeta record (mc.hpp) is 56 bytes, laid out as: name ptr @0, tA2lTypeId @8,
+    /// x_dim @10, flags @12, comment ptr @16, unit ptr @24, min @32, max @40, id-slot ptr @48.
+    /// The three string pointers are absolute virtual addresses into .rodata (our binaries are
+    /// linked at base 0, so the stored value is the string's vaddr and no relocation needs to be
+    /// applied). Identifiers are NOT read from the binary: they are the 1-based position of each
+    /// name in the byte-wise sorted, de-duplicated set of names -- exactly how register_measurements()
+    /// assigns them at runtime (identifier-addressing spec §3). Reproducing that sort here is what
+    /// makes the offline A2L agree with a runtime A2L on every id.
+    pub fn register_mci_measurements(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
+        let Some((_base, data)) = self.debug_data.mci_meas_data.as_ref() else {
+            return Ok(());
+        };
+        info!("===============================================================");
+        info!("Registering identifier-addressed measurements from mci_meas section:");
+
+        const REC: usize = 56;
+        if data.len() % REC != 0 {
+            warn!(
+                "mci_meas section is {} bytes, not a multiple of {} -- mc.hpp MeasMeta layout and this reader disagree",
+                data.len(),
+                REC
+            );
+        }
+
+        let is_le = self.debug_data.is_little_endian;
+        let rd_u64 = |b: &[u8]| -> u64 {
+            let a: [u8; 8] = b.try_into().unwrap();
+            if is_le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
+        };
+        let rd_u16 = |b: &[u8]| -> u16 {
+            let a: [u8; 2] = b.try_into().unwrap();
+            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+        };
+        let rd_f64 = |b: &[u8]| -> f64 {
+            let a: [u8; 8] = b.try_into().unwrap();
+            if is_le { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) }
+        };
+
+        struct MeasRec {
+            name: String,
+            ty: i8,
+            x_dim: u16,
+            comment: String,
+            unit: String,
+            min: f64,
+            max: f64,
+        }
+
+        let mut recs: Vec<MeasRec> = Vec::new();
+        for (i, chunk) in data.chunks(REC).enumerate() {
+            if chunk.len() < REC {
+                break;
+            }
+            let name_ptr = rd_u64(&chunk[0..8]);
+            let ty = chunk[8] as i8;
+            let x_dim = rd_u16(&chunk[10..12]);
+            let comment_ptr = rd_u64(&chunk[16..24]);
+            let unit_ptr = rd_u64(&chunk[24..32]);
+            let min = rd_f64(&chunk[32..40]);
+            let max = rd_f64(&chunk[40..48]);
+
+            let Some(name) = self.read_rodata_cstr(name_ptr) else {
+                warn!("mci_meas record {} has an unresolvable name pointer 0x{:08X}; skipping", i, name_ptr);
+                continue;
+            };
+            if name.is_empty() {
+                warn!("mci_meas record {} has an empty name; skipping", i);
+                continue;
+            }
+            let comment = self.read_rodata_cstr(comment_ptr).unwrap_or_default();
+            let unit = self.read_rodata_cstr(unit_ptr).unwrap_or_default();
+            recs.push(MeasRec { name, ty, x_dim, comment, unit, min, max });
+        }
+
+        // Deterministic identifiers: 1-based position in the byte-wise sorted, de-duplicated name
+        // list (spec §3). strcmp on the C strings is a byte comparison, which is exactly the Ord
+        // that sort/dedup on Rust String gives for these ASCII identifiers.
+        let mut names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        // identifier 0 is reserved (invalid), so ids are 1-based.
+        let id_of = |name: &str| -> u32 { (names.binary_search(&name).unwrap() as u32) + 1 };
+
+        let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for r in &recs {
+            let id = id_of(&r.name);
+            // A name measured under several events appears in several records but is one A2L object.
+            if !emitted.insert(id) {
+                continue;
+            }
+            let value_type = a2l_type_to_value_type(r.ty);
+            let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
+            // Match sig_min/sig_max in mc.hpp: the descriptor stores (0.0, 0.0) when neither bound
+            // was given, and that resolves to the type's own range. The range must be xcplite's
+            // (A2lGetTypeMin/Max, mirrored by type_min/type_max in mc.hpp: +-1e12 for float/double/
+            // int64), NOT the registry's own get_min/get_max (+-1e32), so the offline limits equal
+            // the runtime ones.
+            let (min, max) = if r.min == 0.0 && r.max == 0.0 {
+                (Some(a2l_type_min(r.ty)), Some(a2l_type_max(r.ty)))
+            } else {
+                (Some(r.min), Some(r.max))
+            };
+            let mut sd = McSupportData::new(McObjectType::Measurement).set_min(min).set_max(max);
+            if !r.comment.is_empty() {
+                sd = sd.set_comment(r.comment.clone());
+            }
+            if !r.unit.is_empty() {
+                sd = sd.set_unit(r.unit.clone());
+            }
+            // Identifier addressing: the identifier travels in the A2L ECU_ADDRESS with extension
+            // XCP_ADDR_EXT_APP (0x80). Event association is metadata only (spec §7); event 0 is the
+            // default, matching the DWARF sweep in register_variables and the runtime A2L.
+            let addr = McAddress::new_a2l_with_event(0, id, XCP_ADDR_EXT_APP);
+            match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
+                Ok(_) => {
+                    count += 1;
+                    if verbose >= 1 {
+                        info!("  measurement '{}' id={} type={:?} dim={}", r.name, id, value_type, r.x_dim.max(1));
+                    }
+                }
+                Err(e) => error!("Failed to register measurement '{}': {}", r.name, e),
+            }
+        }
+        info!("Registered {} identifier-addressed measurement(s) from mci_meas", count);
+        Ok(())
+    }
+
+    /// Dereference a string pointer stored in a mci_meas descriptor. The pointer is an absolute
+    /// virtual address into .rodata (base 0 for our PIE binaries); it is resolved against the
+    /// captured .rodata bytes. Returns None for a null pointer or an address outside .rodata.
+    fn read_rodata_cstr(&self, vaddr: u64) -> Option<String> {
+        if vaddr == 0 {
+            return None;
+        }
+        let (base, data) = self.debug_data.rodata_data.as_ref()?;
+        if vaddr < *base {
+            return None;
+        }
+        let off = (vaddr - *base) as usize;
+        read_cstr_at(data, off)
+    }
+}
+
+/// XCP address extension marking an identifier-addressed (application-resolved) object:
+/// ECU_ADDRESS_EXTENSION 0x80. Matches XCP_ADDR_EXT_APP in xcplib and A2lSetIdAddrMode on the
+/// mc-instrument runtime side.
+const XCP_ADDR_EXT_APP: u8 = 0x80;
+
+/// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
+/// registry value type. mc-instrument measures `bool` as UINT8, so it arrives here as +1.
+fn a2l_type_to_value_type(t: i8) -> McValueType {
+    match t {
+        1 => McValueType::Ubyte,
+        2 => McValueType::Uword,
+        4 => McValueType::Ulong,
+        8 => McValueType::Ulonglong,
+        -1 => McValueType::Sbyte,
+        -2 => McValueType::Sword,
+        -4 => McValueType::Slong,
+        -8 => McValueType::Slonglong,
+        -9 => McValueType::Float32Ieee,
+        -10 => McValueType::Float64Ieee,
+        other => {
+            warn!("mci_meas: unknown A2L type id {}, defaulting to UBYTE", other);
+            McValueType::Ubyte
+        }
+    }
+}
+
+/// Type lower bound for an unset measurement limit, mirroring xcplite's A2lGetTypeMin (and its C++
+/// copy type_min() in mc.hpp): signed integers use their own minimum, int64/float/double clamp to
+/// -1e12, unsigned integers start at 0. Kept equal to the runtime so the offline A2L agrees.
+fn a2l_type_min(t: i8) -> f64 {
+    match t {
+        -1 => -128.0,
+        -2 => -32768.0,
+        -4 => -2147483648.0,
+        -8 | -9 | -10 => -1e12,
+        _ => 0.0,
+    }
+}
+
+/// Type upper bound for an unset measurement limit, mirroring xcplite's A2lGetTypeMax / type_max()
+/// in mc.hpp: exact maxima for 8/16/32-bit integers, and 1e12 for int64/uint64/float/double.
+fn a2l_type_max(t: i8) -> f64 {
+    match t {
+        -1 => 127.0,
+        -2 => 32767.0,
+        -4 => 2147483647.0,
+        1 => 255.0,
+        2 => 65535.0,
+        4 => 4294967295.0,
+        _ => 1e12,
+    }
 }
 
 // Read a null-terminated UTF-8 string from a byte slice at a given offset
@@ -1025,5 +1240,259 @@ fn apply_instance_metadata(inst: &mut xcp_registry::McInstance, kind: &str, meta
             }
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// mc-instrument calibration field metadata (mci_meta section)
+//
+// A field macro like MC_F64(gain, .unit = "V", .min = 0.0) expands *inside* a class body, so it
+// cannot emit xcp_meta__<kind>__<path> objects the way the measurement macros do: an inline static
+// data member has vague linkage, lands in a COMDAT flavour of its section, and gcc refuses to mix
+// that with the plain objects already in xcp_meta ("causes a section type conflict"). Nor could such
+// an object name its owner -- the preprocessor cannot paste the enclosing type into an identifier.
+//
+// So mc-instrument writes self-describing records into a section of its own instead. Each names the
+// declaring *type*; the segments that instantiate it are found here, from the calseg__<name> markers
+// register_segments already relies on.
+
+/// Byte layout of one `mci::CalMeta`, fixed by mc-instrument's static_asserts (mc.hpp).
+const MCI_META_OWNER_LEN: usize = 64;
+const MCI_META_FIELD_LEN: usize = 64;
+const MCI_META_UNIT_LEN: usize = 32;
+const MCI_META_COMMENT_LEN: usize = 128;
+const MCI_META_RECORD_LEN: usize = MCI_META_OWNER_LEN + MCI_META_FIELD_LEN + MCI_META_UNIT_LEN + MCI_META_COMMENT_LEN + 16;
+
+struct CalMetaRecord {
+    owner: String,
+    field: String,
+    unit: String,
+    comment: String,
+    min: f64,
+    max: f64,
+}
+
+impl CalMetaRecord {
+    /// Nothing stated is the common case -- a field with no metadata still gets a record, because
+    /// the macro cannot see which initialisers were given. Both limits zero is mc-instrument's (and
+    /// xcplite's) "none given", so such a record is dropped rather than turned into a per-field A2L
+    /// typedef that says no more than the shared one it would replace.
+    fn is_empty(&self) -> bool {
+        self.unit.is_empty() && self.comment.is_empty() && self.min == 0.0 && self.max == 0.0
+    }
+
+    fn support_data(&self) -> McSupportData {
+        let mut sd = McSupportData::new(McObjectType::Characteristic);
+        if !self.unit.is_empty() {
+            sd = sd.set_unit(self.unit.clone());
+        }
+        if !self.comment.is_empty() {
+            sd = sd.set_comment(self.comment.clone());
+        }
+        if !(self.min == 0.0 && self.max == 0.0) {
+            sd = sd.set_min(Some(self.min)).set_max(Some(self.max));
+        }
+        sd
+    }
+}
+
+/// One record, or nothing if the slice is short or the strings are not UTF-8.
+fn parse_cal_meta_record(bytes: &[u8], is_le: bool) -> Option<CalMetaRecord> {
+    if bytes.len() < MCI_META_RECORD_LEN {
+        return None;
+    }
+    let mut at = 0;
+    let mut take = |len: usize| -> Option<String> {
+        let s = read_cstr_at(bytes, at)?;
+        at += len;
+        Some(s)
+    };
+    let owner = take(MCI_META_OWNER_LEN)?;
+    let field = take(MCI_META_FIELD_LEN)?;
+    let unit = take(MCI_META_UNIT_LEN)?;
+    let comment = take(MCI_META_COMMENT_LEN)?;
+    let read_f64 = |offset: usize| -> f64 {
+        let raw: [u8; 8] = bytes[offset..offset + 8].try_into().unwrap();
+        if is_le { f64::from_le_bytes(raw) } else { f64::from_be_bytes(raw) }
+    };
+    Some(CalMetaRecord {
+        owner,
+        field,
+        unit,
+        comment,
+        min: read_f64(at),
+        max: read_f64(at + 8),
+    })
+}
+
+impl ElfReader {
+    /// Read mc-instrument's calibration field metadata from the `mci_meta` section and apply it to
+    /// the segments whose type declares each field. Must be called after `register_segments` and
+    /// `register_variables`, whichever route built the objects.
+    pub fn register_cal_metadata(&self, reg: &mut Registry, verbose: usize) -> Result<(), Box<dyn Error>> {
+        let Some(meta_data) = self.debug_data.mci_meta_data.as_ref() else {
+            return Ok(());
+        };
+        if meta_data.is_empty() {
+            return Ok(());
+        }
+        info!("===============================================================");
+        info!("Registering mc-instrument calibration metadata from mci_meta section:");
+
+        let segments = self.calseg_roots();
+        if segments.is_empty() {
+            warn!("mci_meta section present but no calibration segment markers were found; metadata not applied");
+            return Ok(());
+        }
+
+        let is_le = self.debug_data.is_little_endian;
+        for chunk in meta_data.chunks(MCI_META_RECORD_LEN) {
+            let Some(record) = parse_cal_meta_record(chunk, is_le) else {
+                warn!("Trailing {} bytes in mci_meta are not a whole record; mc.hpp and this reader disagree on the layout", chunk.len());
+                break;
+            };
+            if record.is_empty() {
+                continue;
+            }
+            let mut applied = 0;
+            for (segment, root) in &segments {
+                // Where inside this segment a struct of the declaring type sits. Usually nowhere
+                // or at the root; a nested MC_STRUCT puts it one or more members down, and the
+                // field's A2L path then carries that prefix.
+                for prefix in self.paths_to_type(root, &record.owner) {
+                    self.apply_cal_metadata(reg, segment, &format!("{}{}", prefix, record.field), &record, verbose);
+                    applied += 1;
+                }
+            }
+            // Not an error. MC_MEASTYPE declares fields no calibration segment ever holds, and a
+            // type can be declared and never instantiated.
+            if applied == 0 {
+                debug!("Calibration metadata for '{}.{}': no segment holds that type", record.owner, record.field);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply one record to one segment, on whichever of the two shapes the A2L has.
+    ///
+    /// A segment written as a real typedef is an INSTANCE of a TYPEDEF_STRUCTURE, so the field is a
+    /// component of that typedef; a flattened one is a set of instances named `<segment>.<field>`.
+    /// The default is flattened, but the mode is the application's, not ours, so both are tried.
+    fn apply_cal_metadata(&self, reg: &mut Registry, segment: &str, field_path: &str, record: &CalMetaRecord, verbose: usize) {
+        match reg.set_instance_field_support_data(segment, field_path, record.support_data()) {
+            Ok(()) => {
+                if verbose >= 1 {
+                    info!("  Metadata applied to typedef field '{}.{}'", segment, field_path);
+                }
+                return;
+            }
+            Err(RegistryError::NotFound(_)) => {} // not a typedef instance, or no such field: try flattened
+            Err(e) => {
+                warn!("Calibration metadata '{}.{}': {}", segment, field_path, e);
+                return;
+            }
+        }
+
+        let flat = format!("{}.{}", segment, field_path);
+        if let Some(inst) = reg.instance_list.get_instance_mut(&flat, None) {
+            if !record.unit.is_empty() {
+                inst.mc_support_data.update_unit(record.unit.clone());
+            }
+            if !record.comment.is_empty() {
+                inst.mc_support_data.update_comment(record.comment.clone());
+            }
+            if !(record.min == 0.0 && record.max == 0.0) {
+                inst.mc_support_data.update_min(Some(record.min));
+                inst.mc_support_data.update_max(Some(record.max));
+            }
+            if verbose >= 1 {
+                info!("  Metadata applied to instance '{}'", flat);
+            }
+        } else {
+            debug!("Calibration metadata '{}': no typedef field and no instance of that name", flat);
+        }
+    }
+
+    /// Every calibration segment, with the type of its reference page.
+    ///
+    /// The same two steps register_segments takes: the marker `calseg__<name>` gives the segment
+    /// name, and the reference page variable of that same name gives the type.
+    fn calseg_roots(&self) -> Vec<(String, &TypeInfo)> {
+        let mut roots = Vec::new();
+        for var_name in self.debug_data.variables.keys() {
+            let Some(seg_name) = var_name.strip_prefix("calseg__") else {
+                continue;
+            };
+            if seg_name == "epk" {
+                continue;
+            }
+            let root = self
+                .debug_data
+                .variables
+                .get(seg_name)
+                .and_then(|infos| infos.iter().find(|info| info.address.0 == 0 && info.address.1 != 0))
+                .and_then(|info| self.debug_data.types.get(&info.typeref));
+            match root {
+                Some(type_info) => roots.push((seg_name.to_string(), type_info)),
+                None => warn!("Calibration segment '{}': no reference page variable with a type; metadata not applied", seg_name),
+            }
+        }
+        roots
+    }
+}
+
+/// Depth cap rather than a visited set: a calibration struct is a POD tree, so it cannot be
+/// cyclic, and a cap keeps a chain of type references from being followed forever.
+const MCI_MAX_NESTING: usize = 8;
+
+impl ElfReader {
+    /// The dotted member paths inside `root` at which a struct named `owner` sits, each ending in
+    /// a `.` so a field name appends directly. The empty string when `root` is that type itself.
+    ///
+    /// Read out of DWARF rather than out of mci_meta: the section says which *type* declares a
+    /// field, and the struct tree is what turns that into the path a tool knows the field by. A
+    /// field of a nested MC_STRUCT is `<segment>.<outer>.<inner>` in the A2L, and nothing in the
+    /// record itself could know the `<outer>` -- one nested type may sit inside several others,
+    /// as PidGains sits in both `speed` and `torque`.
+    fn paths_to_type(&self, root: &TypeInfo, owner: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        self.walk_for_type(root, owner, String::new(), &mut found, 0);
+        found
+    }
+
+    fn walk_for_type(&self, node: &TypeInfo, owner: &str, prefix: String, found: &mut Vec<String>, depth: usize) {
+        // Only the first level of a struct is expanded in place; below that a member is a
+        // TypeRef into the type map, so the name and the members are both on the other side of
+        // it. Walking without resolving finds a nested type one level down and never deeper.
+        let Some(node) = self.resolve_type(node) else {
+            return;
+        };
+        if node.name.as_deref() == Some(owner) {
+            found.push(prefix.clone());
+            // No early return: a struct may hold another of the same type further down, and both
+            // are real places the field exists.
+        }
+        if depth >= MCI_MAX_NESTING {
+            return;
+        }
+        let members = match &node.datatype {
+            DbgDataType::Struct { members, .. } | DbgDataType::Class { members, .. } | DbgDataType::Union { members, .. } => members,
+            _ => return,
+        };
+        for (name, (member, _offset)) in members {
+            self.walk_for_type(member, owner, format!("{}{}.", prefix, name), found, depth + 1);
+        }
+    }
+
+    /// A type with its TypeRef indirections followed, or nothing when one dangles.
+    fn resolve_type<'a>(&'a self, node: &'a TypeInfo) -> Option<&'a TypeInfo> {
+        let mut current = node;
+        for _ in 0..MCI_MAX_NESTING {
+            let DbgDataType::TypeRef(offset, _) = current.datatype else {
+                return Some(current);
+            };
+            current = self.debug_data.types.get(&offset)?;
+        }
+        None
     }
 }

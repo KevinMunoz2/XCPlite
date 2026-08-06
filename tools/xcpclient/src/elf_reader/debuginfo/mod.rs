@@ -95,6 +95,9 @@ pub(crate) struct DebugData {
     pub(crate) epk_string: Option<String>,                // EPK string read from xcp_epk ELF section
     pub(crate) epk_addr: u64,                             // Address of the xcp_epk ELF section (0 if not found)
     pub(crate) xcp_meta_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of xcp_meta section
+    pub(crate) mci_meta_data: Option<Vec<u8>>,            // raw bytes of the mci_meta section (mc-instrument calibration metadata)
+    pub(crate) mci_meas_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of mci_meas section (mc-instrument measurement descriptors)
+    pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) is_little_endian: bool,                    // ELF endianness
 }
 

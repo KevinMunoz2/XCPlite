@@ -757,9 +757,17 @@ async fn xcp_client(
                 // Register all accessible variables and their types
                 // Skipped in --create-a2l-template mode; events and segments are still registered above
                 if !create_a2l_template {
-                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter)?;
+                    // Identifier addressing: when the ELF carries mc-instrument measurement
+                    // descriptors (mci_meas), suppress the DWARF measurement sweep and emit the
+                    // measurements from the descriptors instead (register_mci_measurements below).
+                    let id_addressing = elf_reader.has_id_addressing();
+                    elf_reader.register_variables(&mut reg, segment_relative, verbose, elf_idx_unit_limit, &elf_var_filter, &elf_unit_filter, id_addressing)?;
                     // Apply metadata (XCP_UNIT / XCP_LIMITS / XCP_COMMENT) from the xcp_meta ELF section
                     elf_reader.register_metadata(&mut reg, verbose)?;
+                    // Apply mc-instrument's calibration field metadata from the mci_meta ELF section
+                    elf_reader.register_cal_metadata(&mut reg, verbose)?;
+                    // Register identifier-addressed measurements from the mci_meas descriptor section
+                    elf_reader.register_mci_measurements(&mut reg, verbose)?;
                 }
             }
 

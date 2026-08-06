@@ -39,6 +39,9 @@ struct DebugDataReader<'elffile> {
     epk_string: Option<String>,
     epk_addr: u64,
     xcp_meta_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes)
+    mci_meta_data: Option<Vec<u8>>,        // raw bytes of the mci_meta section (mc-instrument calibration metadata)
+    mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
+    rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     is_little_endian: bool,
 }
 
@@ -97,6 +100,33 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
     } else {
         log::debug!("XCP metadata section (xcp_meta) not found in ELF file");
     }
+    // read the mci_meta section raw bytes: mc-instrument's calibration field metadata, a packed
+    // array of self-describing records rather than named objects, so no address lookup is needed
+    let mci_meta_data: Option<Vec<u8>> = elffile.section_by_name("mci_meta").and_then(|s| s.data().ok()).map(|data| data.to_vec());
+    if let Some(ref data) = mci_meta_data {
+        log::info!("mc-instrument calibration metadata section (mci_meta) found, {} bytes", data.len());
+    } else {
+        log::debug!("mc-instrument calibration metadata section (mci_meta) not found in ELF file");
+    }
+    // read the mci_meas section: mc-instrument's measurement descriptors (a packed array of
+    // MeasMeta records). Keep the section base address; the records hold absolute pointers into
+    // .rodata for their name/comment/unit strings, so the reader needs .rodata too to resolve them.
+    let mci_meas_data: Option<(u64, Vec<u8>)> = elffile.section_by_name("mci_meas").and_then(|s| {
+        let addr = s.address();
+        s.data().ok().map(|data| (addr, data.to_vec()))
+    });
+    if let Some((addr, ref data)) = mci_meas_data {
+        log::info!("mc-instrument measurement descriptor section (mci_meas) found at address 0x{:08X}, {} bytes", addr, data.len());
+    } else {
+        log::debug!("mc-instrument measurement descriptor section (mci_meas) not found in ELF file");
+    }
+    // .rodata backs the string literals the mci_meas descriptors point at; captured here so those
+    // name/comment/unit pointers can be dereferenced offline without applying relocations
+    let rodata_data: Option<(u64, Vec<u8>)> = elffile.section_by_name(".rodata").and_then(|s| {
+        let addr = s.address();
+        s.data().ok().map(|data| (addr, data.to_vec()))
+    });
+
     let is_little_endian = elffile.endianness() == Endianness::Little;
 
     // get CFA information for DebugDataReader
@@ -128,6 +158,9 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         epk_string,
         epk_addr,
         xcp_meta_data,
+        mci_meta_data,
+        mci_meas_data,
+        rodata_data,
         is_little_endian,
     };
     log::debug!("Reading debug info entries");
@@ -255,6 +288,9 @@ impl DebugDataReader<'_> {
             epk_string: self.epk_string,
             epk_addr: self.epk_addr,
             xcp_meta_data: self.xcp_meta_data,
+            mci_meta_data: self.mci_meta_data,
+            mci_meas_data: self.mci_meas_data,
+            rodata_data: self.rodata_data,
             is_little_endian: self.is_little_endian,
         }
     }
