@@ -360,6 +360,30 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 // Enable individual address extensions for each ODT entry, otherwise address extension must be unique for each DAQ list
 #define XCP_ENABLE_DAQ_ADDREXT
 
+// --- Identifier (resolve-table) addressing mode for DAQ
+// Optional. A DAQ ODT entry stores a deterministic 32 bit identifier in its
+// address field and is tagged with the application address extension
+// (XCP_ADDR_EXT_APP) purely to select this mode -- the extension carries no data,
+// the whole identifier lives in the 32 bit address. The DAQ sampling loop uses
+// that identifier as a key into a table published by XcpSetResolveTable() to get
+// the live pointer, instead of the usual base+offset.
+// One addressing mode then covers globals, stack locals and heap/pointer
+// reachable data without a per-kind address extension, and there is no dynamic
+// base slot limit for pointer reachable objects. The command path
+// (SHORT_UPLOAD/DOWNLOAD/CALC_CHECKSUM) already resolves the application address
+// extension through ApplXcpReadMemory/ApplXcpWriteMemory, so only the DAQ path is
+// affected here.
+#ifdef OPTION_ID_ADDRESSING
+#ifndef XCP_ENABLE_APP_ADDRESSING
+#error "OPTION_ID_ADDRESSING requires application addressing (identifiers travel on XCP_ADDR_EXT_APP)"
+#endif
+#define XCP_ENABLE_ID_ADDRESSING
+// Identifiers travel on the application address extension.
+#define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP
+#define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
+#define XcpAddrDecodeIdOffset(addr) (uint32_t)(addr)
+#endif // OPTION_ID_ADDRESSING
+
 // Static allocated memory for DAQ tables
 // Amount of memory for DAQ tables, each ODT entry (e.g. measurement variable) needs 5 bytes, each DAQ list 12 bytes and
 // each ODT 8 bytes

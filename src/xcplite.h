@@ -184,6 +184,36 @@ void XcpEventExtAt_(tXcpEventId event, int count, const uint8_t **bases, uint64_
 void XcpEventExt_Var(tXcpEventId event, int count, ...);
 void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 
+#ifdef XCP_ENABLE_ID_ADDRESSING
+
+// Identifier (resolve-table) addressing
+//
+// A DAQ ODT entry may carry a 32 bit identifier instead of a base+offset. The
+// identifier indexes the table published here, and the DAQ sampling loop reads
+// table[id].ptr directly. An entry whose ptr is NULL is sampled as zero (a
+// defined "not currently available"), so an armed but not yet live signal
+// produces no fault. Identifiers travel on the application address extension
+// (XCP_ADDR_EXT_APP), so the command path (SHORT_UPLOAD / DOWNLOAD /
+// CALC_CHECKSUM) resolves them through ApplXcpReadMemory / ApplXcpWriteMemory and
+// needs no change. Identifier 0 is reserved as invalid; valid identifiers are
+// 1..count-1 and index the table directly.
+#ifndef XCP_RESOLVE_ENTRY_DEFINED
+#define XCP_RESOLVE_ENTRY_DEFINED
+#define XCP_RESOLVE_SEG_NONE 0xFFFF
+typedef struct {
+    void *ptr;      // Resolved live location, or NULL if not currently available
+    uint32_t size;  // Byte size at ptr, used for DAQ bounds checking at arm time
+    uint16_t seg;   // Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
+    uint16_t flags; // Application defined
+} tXcpResolveEntry;
+#endif // XCP_RESOLVE_ENTRY_DEFINED
+
+// Publish (table != NULL) or clear (table == NULL) the identifier resolution
+// table. The table is indexed directly by identifier; index 0 is reserved.
+void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
+
+#endif // XCP_ENABLE_ID_ADDRESSING
+
 // Enable or disable a XCP DAQ event
 void XcpEventEnable(tXcpEventId event, bool enable);
 

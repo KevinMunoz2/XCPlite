@@ -1213,6 +1213,34 @@ static uint8_t XcpSetDaqPtr(uint16_t daq, uint8_t odt, uint8_t idx) {
     return 0;
 }
 
+#ifdef XCP_ENABLE_ID_ADDRESSING
+
+// Identifier (resolve-table) addressing state, see XcpSetResolveTable() and
+// xcplib.h. Published once by the application; the entry .ptr fields may be
+// updated by the application per trigger for unstable (stack/heap) objects. The
+// DAQ sampling loop reads them without a lock, exactly like the dynamic base
+// pointers passed to XcpEventExt - the application is the single writer of each
+// entry, and a NULL ptr is a defined "not available".
+static const tXcpResolveEntry *gXcpResolveTable = NULL;
+static uint32_t gXcpResolveCount = 0;
+
+void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count) {
+    gXcpResolveTable = table;
+    gXcpResolveCount = (table != NULL) ? count : 0;
+}
+
+// Resolve a 32 bit identifier to a live pointer, or NULL if it is out of range,
+// unregistered or not currently available. Identifier 0 is reserved as invalid;
+// valid identifiers are 1..count-1 and index the table directly.
+static const uint8_t *XcpResolveId(uint32_t id) {
+    if (gXcpResolveTable == NULL || id == 0 || id >= gXcpResolveCount) {
+        return NULL;
+    }
+    return (const uint8_t *)gXcpResolveTable[id].ptr;
+}
+
+#endif // XCP_ENABLE_ID_ADDRESSING
+
 // Add an ODT entry to current DAQ/ODT
 // Supports XCP_ADDR_EXT_/ABS/DYN
 // All ODT entries of a DAQ list must have the same address extension,returns CRC_DAQ_CONFIG if not
@@ -1279,6 +1307,23 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
 #ifdef XCP_ENABLE_APP_ADDRESSING
                 if (XcpAddrIsApp(ext)) {
                 base_offset = XcpAddrDecodeAppOffset(addr);
+#ifdef XCP_ENABLE_ID_ADDRESSING
+                // Identifier addressing travels on the application address
+                // extension. If a resolution table is registered, validate the
+                // identifier and the requested size now, so a bad WRITE_DAQ fails
+                // at arm time instead of sampling garbage. Without a table the
+                // application handles the extension itself (external memory).
+                if (gXcpResolveTable != NULL) {
+                    if (base_offset == 0 || base_offset >= gXcpResolveCount) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: identifier %u out of range (count=%u)\n", base_offset, gXcpResolveCount);
+                        return CRC_OUT_OF_RANGE;
+                    }
+                    if (size > gXcpResolveTable[base_offset].size) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: size %u exceeds identifier %u size %u\n", size, base_offset, gXcpResolveTable[base_offset].size);
+                        return CRC_OUT_OF_RANGE;
+                    }
+                }
+#endif
             } else
 #endif
                 return CRC_ACCESS_DENIED;
@@ -1597,12 +1642,33 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
                 assert(n != 0);
 #endif
 #ifdef XCP_ENABLE_DAQ_ADDREXT
+                uint8_t ext = *addr_ext_ptr++;
+                uint32_t offset = *addr_ptr++;
+#ifdef XCP_ENABLE_ID_ADDRESSING
+                // Identifier addressing: the ODT entry carries a 32 bit
+                // identifier on the application address extension. Resolve it to a
+                // live pointer through the table published by XcpSetResolveTable().
+                // An identifier that is not currently available resolves to NULL
+                // and is sampled as a defined zero, so an armed but not yet live
+                // signal is harmless instead of dereferencing a stale pointer.
+                if (XcpAddrIsId(ext)) {
+                    const uint8_t *src = XcpResolveId(offset);
+                    if (src != NULL) {
+                        memcpy(dst, src, n);
+                    } else {
+                        memset(dst, 0, n);
+                    }
+                    dst += n;
+                    e++;
+                    continue;
+                }
+#endif
 #ifdef XCP_ENABLE_TEST_CHECKS
-                assert(*addr_ext_ptr < count && (bases[*addr_ext_ptr] != NULL || XcpAddrIsAbs(*addr_ext_ptr)));
+                assert(ext < count && (bases[ext] != NULL || XcpAddrIsAbs(ext)));
 #else
                 (void)count;
 #endif
-                const uint8_t *src = (const uint8_t *)((uintptr_t)bases[*addr_ext_ptr++] + *addr_ptr++);
+                const uint8_t *src = (const uint8_t *)((uintptr_t)bases[ext] + offset);
 #else
                 const uint8_t *src = (const uint8_t *)&base[*addr_ptr++];
 #endif

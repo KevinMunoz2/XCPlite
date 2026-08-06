@@ -136,6 +136,17 @@
 // Create an cyclic DAQ event for asynchronous data acquisition
 // #define OPTION_DAQ_ASYNC_EVENT
 
+// Enable identifier (resolve-table) addressing for DAQ
+// A measurement (ODT entry) may carry a 32 bit identifier that is resolved to a
+// live pointer at sample time through a table published by XcpSetResolveTable(),
+// instead of the usual base+offset. One addressing mode then covers globals,
+// stack locals and heap/pointer-reachable data without a per-kind address
+// extension, and there is no dynamic-base slot limit for pointer-reachable
+// objects. The identifier travels on the application address extension, so the
+// command path resolves it through ApplXcpReadMemory/ApplXcpWriteMemory and only
+// the DAQ path is affected. See xcp_cfg.h and XcpSetResolveTable() in xcplib.h.
+#define OPTION_ID_ADDRESSING
+
 // Transport layer queue, vectored IO, lockless with variable queue entry size
 // This is the default queue for 64 bit platforms
 #define OPTION_QUEUE_64_VAR_SIZE // (queue64v.c)

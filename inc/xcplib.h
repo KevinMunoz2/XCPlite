@@ -415,6 +415,34 @@ void XcpEventExtAt(tXcpEventId event, const uint8_t *base2, uint64_t clock);
 void XcpEventExtAt_(tXcpEventId event, int count, const uint8_t **bases, uint64_t clock); // Used by variadic C++ macro/template
 void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 
+// -----------------------------------------------------------------------------
+// Identifier (resolve-table) addressing (optional, requires the library to be
+// built with OPTION_ID_ADDRESSING)
+//
+// A DAQ measurement (ODT entry) may carry a 32 bit identifier instead of a
+// base+offset address. The identifier indexes a table published by
+// XcpSetResolveTable(); the DAQ sampling loop reads table[id].ptr directly, and
+// an entry whose ptr is NULL is sampled as zero ("not currently available").
+// This lets a single addressing mode cover globals, stack locals and
+// heap/pointer-reachable data, and removes the dynamic-base slot limit for
+// pointer-reachable objects. Identifier 0 is reserved; valid identifiers are
+// 1..count-1 and index the table directly.
+#ifndef XCP_RESOLVE_ENTRY_DEFINED
+#define XCP_RESOLVE_ENTRY_DEFINED
+#define XCP_RESOLVE_SEG_NONE 0xFFFF
+typedef struct {
+    void *ptr;      ///< Resolved live location, or NULL if not currently available
+    uint32_t size;  ///< Byte size at ptr, used for DAQ bounds checking at arm time
+    uint16_t seg;   ///< Calibration segment index, or XCP_RESOLVE_SEG_NONE for a measurement
+    uint16_t flags; ///< Application defined
+} tXcpResolveEntry;
+#endif // XCP_RESOLVE_ENTRY_DEFINED
+
+/// Publish or clear the identifier resolution table.
+/// @param table Table indexed directly by identifier (index 0 reserved), or NULL to clear.
+/// @param count Number of entries in the table.
+void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count);
+
 // Enable or disable a XCP DAQ event
 void XcpEventEnable(tXcpEventId event, bool enable);
 
