@@ -972,26 +972,100 @@ impl ElfReader {
         info!("===============================================================");
         info!("Registering identifier-addressed measurements from mci_meas section:");
 
-        const REC: usize = 56;
-        if data.len() % REC != 0 {
+        let is_le = self.debug_data.is_little_endian;
+        let rd_u16_at = |b: &[u8], o: usize| -> u16 {
+            let a: [u8; 2] = b[o..o + 2].try_into().unwrap();
+            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
+        };
+
+        // How to parse a record. mc.hpp emits a MeasLayout into mci_layout precisely so this is
+        // read rather than assumed: MeasMeta holds pointers, so its stride and field offsets move
+        // with the target ABI, and every VX1000 target is 32-bit. Binaries built before that
+        // section existed are all LP64, so their historical layout is the fallback.
+        struct Layout {
+            rec: usize,
+            ptr: usize,
+            o_name: usize,
+            o_type: usize,
+            o_x_dim: usize,
+            o_comment: usize,
+            o_unit: usize,
+            o_min: usize,
+            o_max: usize,
+            // Layout version 2. `None` on a v1 binary, where every object is identifier-addressed.
+            o_event: Option<usize>,
+            o_addr: Option<usize>,
+        }
+        const LP64: Layout = Layout {
+            rec: 56,
+            ptr: 8,
+            o_name: 0,
+            o_type: 8,
+            o_x_dim: 10,
+            o_comment: 16,
+            o_unit: 24,
+            o_min: 32,
+            o_max: 40,
+            o_event: None,
+            o_addr: None,
+        };
+
+        let lay = match self.debug_data.mci_layout_data.as_ref() {
+            Some(b) if b.len() >= 20 => {
+                let ver = b[3];
+                if ver > 2 {
+                    warn!("mci_layout version {} is newer than this reader understands (2); parsing the fields version 2 defines and ignoring the rest", ver);
+                }
+                // v2 appended o_event and o_addr, so every v1 offset is still where it was.
+                let has_v2 = ver >= 2 && b.len() >= 24;
+                let l = Layout {
+                    rec: rd_u16_at(b, 0) as usize,
+                    ptr: b[2] as usize,
+                    o_name: rd_u16_at(b, 4) as usize,
+                    o_type: rd_u16_at(b, 6) as usize,
+                    o_x_dim: rd_u16_at(b, 8) as usize,
+                    o_comment: rd_u16_at(b, 12) as usize,
+                    o_unit: rd_u16_at(b, 14) as usize,
+                    o_min: rd_u16_at(b, 16) as usize,
+                    o_max: rd_u16_at(b, 18) as usize,
+                    o_event: if has_v2 { Some(rd_u16_at(b, 20) as usize) } else { None },
+                    o_addr: if has_v2 { Some(rd_u16_at(b, 22) as usize) } else { None },
+                };
+                info!("mci_meas layout from mci_layout: {}-byte records, {}-bit pointers", l.rec, l.ptr * 8);
+                l
+            }
+            Some(b) => {
+                warn!("mci_layout section is {} bytes, too short for a MeasLayout record; assuming the 64-bit layout", b.len());
+                LP64
+            }
+            None => LP64,
+        };
+
+        if lay.rec == 0 || lay.ptr == 0 || (lay.ptr != 4 && lay.ptr != 8) {
+            warn!("mci_layout describes {}-byte records with {}-byte pointers, which is not parseable; skipping mci_meas", lay.rec, lay.ptr);
+            return Ok(());
+        }
+        if data.len() % lay.rec != 0 {
             warn!(
-                "mci_meas section is {} bytes, not a multiple of {} -- mc.hpp MeasMeta layout and this reader disagree",
+                "mci_meas section is {} bytes, not a multiple of the {}-byte record stride -- mc.hpp MeasMeta layout and this reader disagree",
                 data.len(),
-                REC
+                lay.rec
             );
         }
 
-        let is_le = self.debug_data.is_little_endian;
-        let rd_u64 = |b: &[u8]| -> u64 {
-            let a: [u8; 8] = b.try_into().unwrap();
-            if is_le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
+        // A pointer field, widened to u64 so the rest of the reader is word-size agnostic.
+        let rd_ptr = |b: &[u8], o: usize| -> u64 {
+            if lay.ptr == 8 {
+                let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
+                if is_le { u64::from_le_bytes(a) } else { u64::from_be_bytes(a) }
+            } else {
+                let a: [u8; 4] = b[o..o + 4].try_into().unwrap();
+                (if is_le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }) as u64
+            }
         };
-        let rd_u16 = |b: &[u8]| -> u16 {
-            let a: [u8; 2] = b.try_into().unwrap();
-            if is_le { u16::from_le_bytes(a) } else { u16::from_be_bytes(a) }
-        };
-        let rd_f64 = |b: &[u8]| -> f64 {
-            let a: [u8; 8] = b.try_into().unwrap();
+        let rd_u16 = |b: &[u8], o: usize| -> u16 { rd_u16_at(b, o) };
+        let rd_f64 = |b: &[u8], o: usize| -> f64 {
+            let a: [u8; 8] = b[o..o + 8].try_into().unwrap();
             if is_le { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) }
         };
 
@@ -1003,20 +1077,34 @@ impl ElfReader {
             unit: String,
             min: f64,
             max: f64,
+            /// Absolute address, when the backend supplied one. `Some` switches this object from
+            /// identifier addressing to a plain address in the A2L -- what the VX1000 backend
+            /// needs, because the device samples ECU memory from outside the CPU and cannot ask
+            /// the application to resolve an identifier at trigger time.
+            addr: Option<u32>,
+            /// Owning event's name. Only meaningful together with `addr`: identifier-addressed
+            /// objects carry their event as metadata instead (spec §7).
+            event: String,
         }
 
         let mut recs: Vec<MeasRec> = Vec::new();
-        for (i, chunk) in data.chunks(REC).enumerate() {
-            if chunk.len() < REC {
+        for (i, chunk) in data.chunks(lay.rec).enumerate() {
+            if chunk.len() < lay.rec {
                 break;
             }
-            let name_ptr = rd_u64(&chunk[0..8]);
-            let ty = chunk[8] as i8;
-            let x_dim = rd_u16(&chunk[10..12]);
-            let comment_ptr = rd_u64(&chunk[16..24]);
-            let unit_ptr = rd_u64(&chunk[24..32]);
-            let min = rd_f64(&chunk[32..40]);
-            let max = rd_f64(&chunk[40..48]);
+            let name_ptr = rd_ptr(chunk, lay.o_name);
+            let ty = chunk[lay.o_type] as i8;
+            let x_dim = rd_u16(chunk, lay.o_x_dim);
+            let comment_ptr = rd_ptr(chunk, lay.o_comment);
+            let unit_ptr = rd_ptr(chunk, lay.o_unit);
+            let min = rd_f64(chunk, lay.o_min);
+            let max = rd_f64(chunk, lay.o_max);
+            let addr = lay.o_addr.map(|o| rd_ptr(chunk, o)).filter(|a| *a != 0).map(|a| a as u32);
+            let event = lay
+                .o_event
+                .map(|o| rd_ptr(chunk, o))
+                .and_then(|p| self.read_rodata_cstr(p))
+                .unwrap_or_default();
 
             let Some(name) = self.read_rodata_cstr(name_ptr) else {
                 warn!("mci_meas record {} has an unresolvable name pointer 0x{:08X}; skipping", i, name_ptr);
@@ -1028,7 +1116,7 @@ impl ElfReader {
             }
             let comment = self.read_rodata_cstr(comment_ptr).unwrap_or_default();
             let unit = self.read_rodata_cstr(unit_ptr).unwrap_or_default();
-            recs.push(MeasRec { name, ty, x_dim, comment, unit, min, max });
+            recs.push(MeasRec { name, ty, x_dim, comment, unit, min, max, addr, event });
         }
 
         // Deterministic identifiers: 1-based position in the byte-wise sorted, de-duplicated name
@@ -1067,10 +1155,34 @@ impl ElfReader {
             if !r.unit.is_empty() {
                 sd = sd.set_unit(r.unit.clone());
             }
-            // Identifier addressing: the identifier travels in the A2L ECU_ADDRESS with extension
+            // Two addressing modes, chosen per record by whether the backend supplied an address.
+            //
+            // Absolute (VX1000): the descriptor carries the object's real address, so it goes into
+            // ECU_ADDRESS with extension 0 and the object is bound to its owning event by name.
+            // The VX samples ECU memory from outside the CPU, so there is nobody to resolve an
+            // identifier at trigger time and the address has to be in the A2L.
+            //
+            // Identifier (xcplite): the identifier travels in ECU_ADDRESS with extension
             // XCP_ADDR_EXT_APP (0x80). Event association is metadata only (spec §7); event 0 is the
             // default, matching the DWARF sweep in register_variables and the runtime A2L.
-            let addr = McAddress::new_a2l_with_event(0, id, XCP_ADDR_EXT_APP);
+            let addr = match r.addr {
+                Some(a) => {
+                    let event_id = match reg.event_list.find_event(&r.event, 0) {
+                        Some(e) => e.id,
+                        None => {
+                            if !r.event.is_empty() {
+                                warn!(
+                                    "measurement '{}' names event '{}', which is not in the ELF's event section; binding it to event 0",
+                                    r.name, r.event
+                                );
+                            }
+                            0
+                        }
+                    };
+                    McAddress::new_a2l_with_event(event_id, a, 0)
+                }
+                None => McAddress::new_a2l_with_event(0, id, XCP_ADDR_EXT_APP),
+            };
             match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
                 Ok(_) => {
                     count += 1;

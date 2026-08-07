@@ -41,6 +41,7 @@ struct DebugDataReader<'elffile> {
     xcp_meta_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes)
     mci_meta_data: Option<Vec<u8>>,        // raw bytes of the mci_meta section (mc-instrument calibration metadata)
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
+    mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
     is_little_endian: bool,
 }
@@ -120,6 +121,16 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
     } else {
         log::debug!("mc-instrument measurement descriptor section (mci_meas) not found in ELF file");
     }
+    // read the mci_layout section: a single MeasLayout record (mc.hpp) telling this reader the
+    // record stride and every field offset for THIS binary's ABI. MeasMeta holds pointers, so its
+    // layout moves with the word size -- and not only by the pointer width, since `double` aligns
+    // to 4 on i386 and to 8 on ARM32. Absent (older binaries) means the historical LP64 layout.
+    let mci_layout_data: Option<Vec<u8>> = elffile.section_by_name("mci_layout").and_then(|s| s.data().ok()).map(|d| d.to_vec());
+    if let Some(ref data) = mci_layout_data {
+        log::info!("mc-instrument layout section (mci_layout) found, {} bytes", data.len());
+    } else {
+        log::debug!("mc-instrument layout section (mci_layout) not found; assuming the historical 64-bit MeasMeta layout");
+    }
     // .rodata backs the string literals the mci_meas descriptors point at; captured here so those
     // name/comment/unit pointers can be dereferenced offline without applying relocations
     let rodata_data: Option<(u64, Vec<u8>)> = elffile.section_by_name(".rodata").and_then(|s| {
@@ -160,6 +171,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         xcp_meta_data,
         mci_meta_data,
         mci_meas_data,
+        mci_layout_data,
         rodata_data,
         is_little_endian,
     };
@@ -290,6 +302,7 @@ impl DebugDataReader<'_> {
             xcp_meta_data: self.xcp_meta_data,
             mci_meta_data: self.mci_meta_data,
             mci_meas_data: self.mci_meas_data,
+            mci_layout_data: self.mci_layout_data,
             rodata_data: self.rodata_data,
             is_little_endian: self.is_little_endian,
         }

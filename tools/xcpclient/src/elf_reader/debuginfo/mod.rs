@@ -97,6 +97,7 @@ pub(crate) struct DebugData {
     pub(crate) xcp_meta_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of xcp_meta section
     pub(crate) mci_meta_data: Option<Vec<u8>>,            // raw bytes of the mci_meta section (mc-instrument calibration metadata)
     pub(crate) mci_meas_data: Option<(u64, Vec<u8>)>,     // (section_base_addr, raw_bytes) of mci_meas section (mc-instrument measurement descriptors)
+    pub(crate) mci_layout_data: Option<Vec<u8>>,          // raw bytes of the mci_layout section: how to parse an mci_meas record on this ABI
     pub(crate) rodata_data: Option<(u64, Vec<u8>)>,       // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers in mci_meas
     pub(crate) is_little_endian: bool,                    // ELF endianness
 }
