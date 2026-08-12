@@ -1283,6 +1283,13 @@ impl ElfReader {
 /// XCP address extension marking an identifier-addressed (application-resolved) object:
 /// ECU_ADDRESS_EXTENSION 0x80. Matches XCP_ADDR_EXT_APP in xcplib and A2lSetIdAddrMode on the
 /// mc-instrument runtime side.
+/// Correct for the default XCPLITE__CASDD scheme, which is what mc-instrument builds. Under
+/// XCPLITE__AXSDD (no calibration segments) and XCPLITE__CXSDD (SHM) the application extension
+/// is 0x01 instead (xcp_cfg.h:135,145) -- and nothing in the ELF says which scheme was used, so
+/// this cannot be derived here. An A2L generated from a binary built in one of those schemes
+/// would carry ECU_ADDRESS_EXTENSION 128 while the application only accepts 1, and every
+/// WRITE_DAQ would be rejected. Loud, at least. Carrying the extension in the mci_layout record
+/// is the real fix and needs a layout version bump on both sides.
 const XCP_ADDR_EXT_APP: u8 = 0x80;
 
 /// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the

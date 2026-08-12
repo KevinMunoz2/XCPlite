@@ -193,9 +193,11 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // table[id].ptr directly. An entry whose ptr is NULL is sampled as zero (a
 // defined "not currently available"), so an armed but not yet live signal
 // produces no fault. Identifiers travel on the application address extension
-// (XCP_ADDR_EXT_APP), so the command path (SHORT_UPLOAD / DOWNLOAD /
-// CALC_CHECKSUM) resolves them through ApplXcpReadMemory / ApplXcpWriteMemory and
-// needs no change. Identifier 0 is reserved as invalid; valid identifiers are
+// (XCP_ADDR_EXT_APP). The command path (SHORT_UPLOAD / DOWNLOAD / CALC_CHECKSUM)
+// does NOT resolve them: the hook exists (ApplXcpReadMemory / ApplXcpWriteMemory)
+// but xcpappl.c's default returns CRC_ACCESS_DENIED and mc-instrument registers no
+// callback, so polling a signal without arming DAQ answers with an error. Only the
+// DAQ path is supported today. Identifier 0 is reserved as invalid; valid identifiers are
 // 1..count-1 and index the table directly.
 #ifndef XCP_RESOLVE_ENTRY_DEFINED
 #define XCP_RESOLVE_ENTRY_DEFINED

@@ -145,7 +145,14 @@
 // objects. The identifier travels on the application address extension, so the
 // command path resolves it through ApplXcpReadMemory/ApplXcpWriteMemory and only
 // the DAQ path is affected. See xcp_cfg.h and XcpSetResolveTable() in xcplib.h.
-#define OPTION_ID_ADDRESSING
+// NOT defined here on purpose. Identifier addressing is our fork's addition, and defining it
+// in the shared default configuration turned it on for every XCPLITE_CONFIGURATION=default
+// build -- upstream's own examples and tests included -- so any ODT entry tagged with the
+// application address extension was silently routed through the resolve table. mc-instrument
+// sets it from its own build instead (target_compile_definitions in its CMakeLists.txt), which
+// keeps this file closer to upstream and makes the next rebase smaller.
+//
+// #define OPTION_ID_ADDRESSING
 
 // Transport layer queue, vectored IO, lockless with variable queue entry size
 // This is the default queue for 64 bit platforms
