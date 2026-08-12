@@ -1163,25 +1163,28 @@ impl ElfReader {
             // identifier at trigger time and the address has to be in the A2L.
             //
             // Identifier (xcplite): the identifier travels in ECU_ADDRESS with extension
-            // XCP_ADDR_EXT_APP (0x80). Event association is metadata only (spec §7); event 0 is the
-            // default, matching the DWARF sweep in register_variables and the runtime A2L.
-            let addr = match r.addr {
-                Some(a) => {
-                    let event_id = match reg.event_list.find_event(&r.event, 0) {
-                        Some(e) => e.id,
-                        None => {
-                            if !r.event.is_empty() {
-                                warn!(
-                                    "measurement '{}' names event '{}', which is not in the ELF's event section; binding it to event 0",
-                                    r.name, r.event
-                                );
-                            }
-                            0
-                        }
-                    };
-                    McAddress::new_a2l_with_event(event_id, a, 0)
+            // XCP_ADDR_EXT_APP (0x80). The event association still matters -- it is what the
+            // generator turns into per-event DAQ lists and a non-zero EventId, and it decides
+            // which event refreshes the resolution-table pointer this identifier reads through.
+            // Binding every identifier to event 0 (as this used to) left the 2nd..nth event
+            // arming nothing at all: its signals were sampled on event 0's list instead, at the
+            // wrong rate, and for anything not at a fixed address off a pointer that event never
+            // refreshes.
+            let event_id = match reg.event_list.find_event(&r.event, 0) {
+                Some(e) => e.id,
+                None => {
+                    if !r.event.is_empty() {
+                        warn!(
+                            "measurement '{}' names event '{}', which is not in the ELF's event section; binding it to event 0",
+                            r.name, r.event
+                        );
+                    }
+                    0
                 }
-                None => McAddress::new_a2l_with_event(0, id, XCP_ADDR_EXT_APP),
+            };
+            let addr = match r.addr {
+                Some(a) => McAddress::new_a2l_with_event(event_id, a, 0),
+                None => McAddress::new_a2l_with_event(event_id, id, XCP_ADDR_EXT_APP),
             };
             match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
                 Ok(_) => {
