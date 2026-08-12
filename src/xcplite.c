@@ -52,6 +52,8 @@
 #include "xcp_cfg.h"   // XCP protocol layer configuration parameters (XCP_xxx)
 #include "xcptl_cfg.h" // XCP transport layer configuration parameters (XCPTL_xxx)
 
+#include <stdatomic.h>
+
 #include "xcplite.h" // XCP protocol layer interface functions
 
 #include <assert.h>   // for assert
@@ -1221,22 +1223,44 @@ static uint8_t XcpSetDaqPtr(uint16_t daq, uint8_t odt, uint8_t idx) {
 // DAQ sampling loop reads them without a lock, exactly like the dynamic base
 // pointers passed to XcpEventExt - the application is the single writer of each
 // entry, and a NULL ptr is a defined "not available".
-static const tXcpResolveEntry *gXcpResolveTable = NULL;
-static uint32_t gXcpResolveCount = 0;
+// Atomic because two threads read them: the XCP command thread when it validates an ODT entry,
+// and the application thread on every DAQ sample. Relaxed/acquire loads are enough -- the table's
+// contents are published before the count is raised (see XcpSetResolveTable).
+static _Atomic uintptr_t gXcpResolveTable = (uintptr_t)NULL;
+static _Atomic uint32_t gXcpResolveCount = 0;
 
 void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count) {
-    gXcpResolveTable = table;
-    gXcpResolveCount = (table != NULL) ? count : 0;
+    // Ordered so a concurrent reader never sees a new pointer with an old count. The XCP
+    // command thread reads both in XcpAddOdtEntry and the application thread reads both per
+    // ODT entry per sample, so a re-publication with a smaller table could otherwise be
+    // observed mid-update and index past the new table's end.
+    //
+    // Close the window first (count 0 rejects every id), then publish the pointer, then open
+    // it again at the real count.
+    atomic_store_explicit(&gXcpResolveCount, 0, memory_order_relaxed);
+    atomic_store_explicit(&gXcpResolveTable, (uintptr_t)table, memory_order_release);
+    atomic_store_explicit(&gXcpResolveCount, (table != NULL) ? count : 0, memory_order_release);
 }
 
 // Resolve a 32 bit identifier to a live pointer, or NULL if it is out of range,
 // unregistered or not currently available. Identifier 0 is reserved as invalid;
 // valid identifiers are 1..count-1 and index the table directly.
-static const uint8_t *XcpResolveId(uint32_t id) {
-    if (gXcpResolveTable == NULL || id == 0 || id >= gXcpResolveCount) {
+static const uint8_t *XcpResolveId(uint32_t id, uint32_t n) {
+    // Acquire, paired with the release stores in XcpSetResolveTable: reading the count first
+    // and the pointer after means the entries this count covers are already visible.
+    const uint32_t count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
+    const tXcpResolveEntry *table = (const tXcpResolveEntry *)atomic_load_explicit(&gXcpResolveTable, memory_order_acquire);
+    if (table == NULL || id == 0 || id >= count) {
         return NULL;
     }
-    return (const uint8_t *)gXcpResolveTable[id].ptr;
+    // The arm-time check bounded n by the slot's size, but one identifier is shared by every
+    // descriptor with the same *name* and the size recorded there is the widest of them. Two
+    // same-named objects of different width therefore pass the arm-time check on the wider one
+    // and then read past the end of the narrower. Re-check against the slot as it stands now.
+    if (n > table[id].size) {
+        return NULL;
+    }
+    return (const uint8_t *)table[id].ptr;
 }
 
 #endif // XCP_ENABLE_ID_ADDRESSING
@@ -1313,13 +1337,26 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
                 // identifier and the requested size now, so a bad WRITE_DAQ fails
                 // at arm time instead of sampling garbage. Without a table the
                 // application handles the extension itself (external memory).
-                if (gXcpResolveTable != NULL) {
-                    if (base_offset == 0 || base_offset >= gXcpResolveCount) {
-                        DBG_PRINTF_ERROR("WRITE_DAQ: identifier %u out of range (count=%u)\n", base_offset, gXcpResolveCount);
+                // No table means nothing can resolve. Accepting the entry armed a DAQ list
+                // that samples defined zeros for every identifier -- a successful
+                // START_STOP_DAQ_LIST and a screen full of 0.0, with nothing in the log.
+                // Refuse instead: mc-instrument publishes the table during MC_APP's
+                // constructor, so this can only mean a client connected before the
+                // application finished starting, or an application that never publishes one.
+                {
+                    const uint32_t resolve_count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
+                    const tXcpResolveEntry *resolve_table =
+                        (const tXcpResolveEntry *)atomic_load_explicit(&gXcpResolveTable, memory_order_acquire);
+                    if (resolve_table == NULL) {
+                        DBG_PRINT_ERROR("WRITE_DAQ: identifier addressing requested but no resolve table is published\n");
+                        return CRC_ACCESS_DENIED;
+                    }
+                    if (base_offset == 0 || base_offset >= resolve_count) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: identifier %u out of range (count=%u)\n", base_offset, resolve_count);
                         return CRC_OUT_OF_RANGE;
                     }
-                    if (size > gXcpResolveTable[base_offset].size) {
-                        DBG_PRINTF_ERROR("WRITE_DAQ: size %u exceeds identifier %u size %u\n", size, base_offset, gXcpResolveTable[base_offset].size);
+                    if (size > resolve_table[base_offset].size) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: size %u exceeds identifier %u size %u\n", size, base_offset, resolve_table[base_offset].size);
                         return CRC_OUT_OF_RANGE;
                     }
                 }
@@ -1652,7 +1689,7 @@ static void XcpTriggerDaqList_(tQueueHandle queue_handle, uint16_t daq, const ui
                 // and is sampled as a defined zero, so an armed but not yet live
                 // signal is harmless instead of dereferencing a stale pointer.
                 if (XcpAddrIsId(ext)) {
-                    const uint8_t *src = XcpResolveId(offset);
+                    const uint8_t *src = XcpResolveId(offset, n);
                     if (src != NULL) {
                         memcpy(dst, src, n);
                     } else {

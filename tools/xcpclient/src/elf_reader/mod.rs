@@ -1045,12 +1045,39 @@ impl ElfReader {
             warn!("mci_layout describes {}-byte records with {}-byte pointers, which is not parseable; skipping mci_meas", lay.rec, lay.ptr);
             return Ok(());
         }
-        if data.len() % lay.rec != 0 {
+        // Every field the reader is about to slice has to lie inside a record. Without this a
+        // layout claiming, say, 16-byte records with min at offset 32 passes the chunk-length
+        // check and then panics in rd_f64 with a backtrace instead of a diagnostic.
+        let fits = |offset: usize, width: usize| offset + width <= lay.rec;
+        let bad = [
+            ("name", lay.o_name, lay.ptr),
+            ("type", lay.o_type, 1),
+            ("x_dim", lay.o_x_dim, 2),
+            ("comment", lay.o_comment, lay.ptr),
+            ("unit", lay.o_unit, lay.ptr),
+            ("min", lay.o_min, 8),
+            ("max", lay.o_max, 8),
+        ]
+        .into_iter()
+        .find(|(_, offset, width)| !fits(*offset, *width));
+        if let Some((field, offset, width)) = bad {
             warn!(
-                "mci_meas section is {} bytes, not a multiple of the {}-byte record stride -- mc.hpp MeasMeta layout and this reader disagree",
+                "mci_layout puts '{}' at offset {} ({} bytes) in a {}-byte record, which does not fit; skipping mci_meas",
+                field, offset, width, lay.rec
+            );
+            return Ok(());
+        }
+
+        if data.len() % lay.rec != 0 {
+            // Not a warning to carry on from: if the stride disagrees, every field read after
+            // the first record lands in the middle of another one, so the measurements this
+            // would emit are fabricated rather than merely incomplete.
+            warn!(
+                "mci_meas section is {} bytes, not a multiple of the {}-byte record stride -- mc.hpp MeasMeta layout and this reader disagree; skipping mci_meas rather than emitting fabricated signals",
                 data.len(),
                 lay.rec
             );
+            return Ok(());
         }
 
         // A pointer field, widened to u64 so the rest of the reader is word-size agnostic.
@@ -1106,13 +1133,29 @@ impl ElfReader {
                 .and_then(|p| self.read_rodata_cstr(p))
                 .unwrap_or_default();
 
+            // Identifiers are the 1-based position in the sorted, de-duplicated name list, and
+            // the application derives them the same way from *every* descriptor. Dropping a
+            // record here would shift every alphabetically-later identifier by one, so the A2L
+            // would say `spectrum` is 7 while the application resolves 8 -- the kernel would arm
+            // 7, xcplite would resolve it happily, and the user would get another variable's
+            // bytes as plausible-looking numbers. An A2L that cannot reproduce the runtime's
+            // assignment is worse than no A2L, so this is fatal rather than a skip.
             let Some(name) = self.read_rodata_cstr(name_ptr) else {
-                warn!("mci_meas record {} has an unresolvable name pointer 0x{:08X}; skipping", i, name_ptr);
-                continue;
+                return Err(format!(
+                    "mci_meas record {} has an unresolvable name pointer 0x{:08X}. Identifiers are \
+                     positional, so skipping it would renumber every later signal and the A2L would \
+                     describe the wrong variables.",
+                    i, name_ptr
+                )
+                .into());
             };
             if name.is_empty() {
-                warn!("mci_meas record {} has an empty name; skipping", i);
-                continue;
+                return Err(format!(
+                    "mci_meas record {} has an empty name; identifiers are positional, so it cannot \
+                     be skipped without renumbering every later signal.",
+                    i
+                )
+                .into());
             }
             let comment = self.read_rodata_cstr(comment_ptr).unwrap_or_default();
             let unit = self.read_rodata_cstr(unit_ptr).unwrap_or_default();
@@ -1128,6 +1171,17 @@ impl ElfReader {
         // identifier 0 is reserved (invalid), so ids are 1-based.
         let id_of = |name: &str| -> u32 { (names.binary_search(&name).unwrap() as u32) + 1 };
 
+        // When one name appears in several records, the runtime keeps the WIDEST of them
+        // (`register_measurements` takes the max of type_size * x_dim), so the A2L has to
+        // describe the same one or the master arms a width the application did not reserve.
+        // Taking the first record instead let link order decide what the signal's type was.
+        let widest_for_id = |id: u32| -> &MeasRec {
+            recs.iter()
+                .filter(|r| id_of(&r.name) == id)
+                .max_by_key(|r| (a2l_type_size(r.ty) as u32) * u32::from(r.x_dim.max(1)))
+                .expect("id came from recs")
+        };
+
         let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut count = 0usize;
         for r in &recs {
@@ -1136,6 +1190,16 @@ impl ElfReader {
             if !emitted.insert(id) {
                 continue;
             }
+            let widest = widest_for_id(id);
+            if widest.ty != r.ty || widest.x_dim.max(1) != r.x_dim.max(1) {
+                warn!(
+                    "measurement '{}' is described by records that disagree on shape (type {} dim {} \
+                     vs type {} dim {}); using the wider one, which is what the application's \
+                     resolve table reserves. Give one of them a .name of its own.",
+                    r.name, r.ty, r.x_dim.max(1), widest.ty, widest.x_dim.max(1)
+                );
+            }
+            let r = widest;
             let value_type = a2l_type_to_value_type(r.ty);
             let dim_type = McDimType::new(value_type, r.x_dim.max(1), 1);
             // Match sig_min/sig_max in mc.hpp: the descriptor stores (0.0, 0.0) when neither bound
@@ -1223,6 +1287,16 @@ const XCP_ADDR_EXT_APP: u8 = 0x80;
 
 /// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
 /// registry value type. mc-instrument measures `bool` as UINT8, so it arrives here as +1.
+/// Byte size of an A2L type id. The magnitude *is* the size for the integers (see
+/// mc_meas_abi.hpp); the two float ids sit past them and carry their own.
+fn a2l_type_size(t: i8) -> u32 {
+    match t {
+        -9 => 4,
+        -10 => 8,
+        other => u32::from(other.unsigned_abs()),
+    }
+}
+
 fn a2l_type_to_value_type(t: i8) -> McValueType {
     match t {
         1 => McValueType::Ubyte,
@@ -1463,8 +1537,19 @@ impl ElfReader {
         let is_le = self.debug_data.is_little_endian;
         for chunk in meta_data.chunks(MCI_META_RECORD_LEN) {
             let Some(record) = parse_cal_meta_record(chunk, is_le) else {
-                warn!("Trailing {} bytes in mci_meta are not a whole record; mc.hpp and this reader disagree on the layout", chunk.len());
-                break;
+                // Two different failures share this None. A short chunk is the end of the
+                // section and there is nothing after it; anything else is one bad record, and
+                // breaking there silently discarded the metadata of every field declared after
+                // it.
+                if chunk.len() < MCI_META_RECORD_LEN {
+                    warn!(
+                        "Trailing {} bytes in mci_meta are not a whole record; mc.hpp and this reader disagree on the layout",
+                        chunk.len()
+                    );
+                    break;
+                }
+                warn!("an mci_meta record could not be decoded (non-UTF-8 text?); skipping it and continuing");
+                continue;
             };
             if record.is_empty() {
                 continue;
