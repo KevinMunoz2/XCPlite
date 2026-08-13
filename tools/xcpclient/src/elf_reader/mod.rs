@@ -1248,7 +1248,13 @@ impl ElfReader {
             };
             let addr = match r.addr {
                 Some(a) => McAddress::new_a2l_with_event(event_id, a, 0),
-                None => McAddress::new_a2l_with_event(event_id, id, XCP_ADDR_EXT_APP),
+                // The identifier occupies the high 16 bits and the low 16 are a byte offset into
+                // the object (0 for the whole object). The field is split so that address
+                // arithmetic works: a master selecting one array element sends ECU_ADDRESS +
+                // i*elemsize, and an object wider than one ODT entry is armed as chunks at
+                // ECU_ADDRESS + k*248. With the whole word spent on the identifier those landed
+                // on unrelated objects. Mirrors XcpAddrEncodeId in xcp_cfg.h.
+                None => McAddress::new_a2l_with_event(event_id, id << XCP_ID_OFFSET_BITS, XCP_ADDR_EXT_APP),
             };
             match reg.instance_list.add_instance(r.name.clone(), dim_type, sd, addr) {
                 Ok(_) => {
@@ -1291,6 +1297,10 @@ impl ElfReader {
 /// WRITE_DAQ would be rejected. Loud, at least. Carrying the extension in the mci_layout record
 /// is the real fix and needs a layout version bump on both sides.
 const XCP_ADDR_EXT_APP: u8 = 0x80;
+
+/// How many low bits of the address field are a byte offset into the object the identifier names.
+/// Must equal XCP_ID_OFFSET_BITS in xcplite's xcp_cfg.h -- the server decodes what this encodes.
+const XCP_ID_OFFSET_BITS: u32 = 16;
 
 /// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
 /// registry value type. mc-instrument measures `bool` as UINT8, so it arrives here as +1.

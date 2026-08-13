@@ -381,7 +381,38 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 // Identifiers travel on the application address extension.
 #define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP
 #define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
-#define XcpAddrDecodeIdOffset(addr) (uint32_t)(addr)
+
+// The 32 bit address field is SPLIT, exactly as segment relative addressing splits it a few
+// lines above (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte
+// offset into it.
+//
+// It has to be split, because a master does arithmetic on ECU_ADDRESS and expects the result to
+// still mean something. Selecting element i of an array sends ECU_ADDRESS + i*elemsize, and any
+// object larger than XCP_MAX_ODT_ENTRY_SIZE must be split across ODT entries at addr, addr+248
+// and so on. With the whole word spent on a dense counter, id+k was another object's identifier:
+// such a request sampled an unrelated variable, or was refused as out of range, depending only
+// on how many signals the application happened to have.
+//
+// 16/16 mirrors the segment mode above: 65535 identifiers, 64 KiB per object -- the same ceiling
+// mc.hpp already imposes on a calibration segment.
+#ifndef XCP_ID_ADDR_LAYOUT_DEFINED
+#define XCP_ID_ADDR_LAYOUT_DEFINED
+// Layout of the 32 bit address field under identifier addressing: the identifier names the
+// object, the low bits are a byte offset into it. Split for the same reason segment relative
+// addressing splits it -- a master does arithmetic on ECU_ADDRESS (element i of an array is
+// ECU_ADDRESS + i*elemsize; an object wider than one ODT entry is armed as chunks at
+// ECU_ADDRESS + k*248) and the result has to keep meaning the same object.
+//
+// Defined in both this public header and src/xcp_cfg.h, behind one guard, because an
+// application that emits these addresses sees only this header while the server decodes them
+// from the other. The two must agree; the guard makes a double include safe, not a divergence.
+#define XCP_ID_OFFSET_BITS 16
+#define XCP_ID_OFFSET_MASK ((uint32_t)((1u << XCP_ID_OFFSET_BITS) - 1u))
+#define XCP_ID_MAX ((uint32_t)(0xFFFFFFFFu >> XCP_ID_OFFSET_BITS))
+#define XcpAddrEncodeId(id, offset) (uint32_t)((((uint32_t)(id)) << XCP_ID_OFFSET_BITS) | (((uint32_t)(offset)) & XCP_ID_OFFSET_MASK))
+#define XcpAddrDecodeId(addr) (uint32_t)(((uint32_t)(addr)) >> XCP_ID_OFFSET_BITS)
+#define XcpAddrDecodeIdOffset(addr) (uint32_t)(((uint32_t)(addr)) & XCP_ID_OFFSET_MASK)
+#endif // XCP_ID_ADDR_LAYOUT_DEFINED
 #endif // OPTION_ID_ADDRESSING
 
 // Static allocated memory for DAQ tables

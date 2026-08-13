@@ -1245,7 +1245,9 @@ void XcpSetResolveTable(const tXcpResolveEntry *table, uint32_t count) {
 // Resolve a 32 bit identifier to a live pointer, or NULL if it is out of range,
 // unregistered or not currently available. Identifier 0 is reserved as invalid;
 // valid identifiers are 1..count-1 and index the table directly.
-static const uint8_t *XcpResolveId(uint32_t id, uint32_t n) {
+static const uint8_t *XcpResolveId(uint32_t packed, uint32_t n) {
+    const uint32_t id = XcpAddrDecodeId(packed);
+    const uint32_t offset = XcpAddrDecodeIdOffset(packed);
     // Acquire, paired with the release stores in XcpSetResolveTable: reading the count first
     // and the pointer after means the entries this count covers are already visible.
     const uint32_t count = atomic_load_explicit(&gXcpResolveCount, memory_order_acquire);
@@ -1253,14 +1255,21 @@ static const uint8_t *XcpResolveId(uint32_t id, uint32_t n) {
     if (table == NULL || id == 0 || id >= count) {
         return NULL;
     }
-    // The arm-time check bounded n by the slot's size, but one identifier is shared by every
-    // descriptor with the same *name* and the size recorded there is the widest of them. Two
-    // same-named objects of different width therefore pass the arm-time check on the wider one
-    // and then read past the end of the narrower. Re-check against the slot as it stands now.
-    if (n > table[id].size) {
+    // Bounded by the object as the slot describes it *now*, offset included. Two things make the
+    // arm-time check insufficient on its own: one identifier is shared by every descriptor with
+    // the same name and the size recorded is the widest of them, so two same-named objects of
+    // different width pass on the wider one; and the slot's pointer is republished per trigger,
+    // so what it points at can change between arming and sampling. Written so neither term can
+    // overflow -- both come off the wire.
+    const uint32_t size = table[id].size;
+    if (offset > size || n > size - offset) {
         return NULL;
     }
-    return (const uint8_t *)table[id].ptr;
+    const uint8_t *base = (const uint8_t *)table[id].ptr;
+    if (base == NULL) {
+        return NULL; // not currently available; adding an offset to NULL would be undefined
+    }
+    return base + offset;
 }
 
 #endif // XCP_ENABLE_ID_ADDRESSING
@@ -1351,12 +1360,19 @@ static uint8_t XcpAddOdtEntry(uint32_t addr, uint8_t ext, uint8_t size) {
                         DBG_PRINT_ERROR("WRITE_DAQ: identifier addressing requested but no resolve table is published\n");
                         return CRC_ACCESS_DENIED;
                     }
-                    if (base_offset == 0 || base_offset >= resolve_count) {
-                        DBG_PRINTF_ERROR("WRITE_DAQ: identifier %u out of range (count=%u)\n", base_offset, resolve_count);
+                    // The address carries an identifier AND a byte offset into the object it
+                    // names, so both halves are validated: a master splitting a large object
+                    // across ODT entries, or selecting one array element, sends a non-zero
+                    // offset here and is entitled to be told when it does not fit.
+                    const uint32_t resolve_id = XcpAddrDecodeId(base_offset);
+                    const uint32_t resolve_offset = XcpAddrDecodeIdOffset(base_offset);
+                    if (resolve_id == 0 || resolve_id >= resolve_count) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: identifier %u out of range (count=%u)\n", resolve_id, resolve_count);
                         return CRC_OUT_OF_RANGE;
                     }
-                    if (size > resolve_table[base_offset].size) {
-                        DBG_PRINTF_ERROR("WRITE_DAQ: size %u exceeds identifier %u size %u\n", size, base_offset, resolve_table[base_offset].size);
+                    const uint32_t resolve_size = resolve_table[resolve_id].size;
+                    if (resolve_offset > resolve_size || size > resolve_size - resolve_offset) {
+                        DBG_PRINTF_ERROR("WRITE_DAQ: offset %u + size %u exceeds identifier %u size %u\n", resolve_offset, size, resolve_id, resolve_size);
                         return CRC_OUT_OF_RANGE;
                     }
                 }
