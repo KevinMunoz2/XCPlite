@@ -1194,12 +1194,35 @@ impl ElfReader {
         // (`register_measurements` takes the max of type_size * x_dim), so the A2L has to
         // describe the same one or the master arms a width the application did not reserve.
         // Taking the first record instead let link order decide what the signal's type was.
-        let widest_for_id = |id: u32| -> &MeasRec {
-            recs.iter()
-                .filter(|r| id_of(&r.name) == id)
-                .max_by_key(|r| (a2l_type_size(r.ty) as u32) * u32::from(r.x_dim.max(1)))
-                .expect("id came from recs")
-        };
+        //
+        // Built once into a map rather than re-scanned per id: this used to filter every record
+        // and binary-search each one's name, once per distinct id, which is O(n^2 log n) in the
+        // measurement count.
+        //
+        // The tie-break is explicit. `max_by_key` returns the LAST maximum, so two records of
+        // equal width used to be separated by their order in the ELF section -- and that order is
+        // compiler-dependent (gcc emits these descriptors in reverse, clang forward). The record
+        // chosen decides the signal's DEFAULT_EVENT_LIST, so the same source built by the other
+        // compiler could bind a two-event signal to the other event. Widest first, then the lowest
+        // event id, which is a property of the program rather than of the toolchain.
+        let mut widest: std::collections::HashMap<u32, &MeasRec> = std::collections::HashMap::new();
+        for r in &recs {
+            let key = |x: &MeasRec| {
+                (
+                    (a2l_type_size(x.ty) as u32) * u32::from(x.x_dim.max(1)),
+                    std::cmp::Reverse(reg.event_list.find_event(&x.event, 0).map_or(u16::MAX, |e| e.id)),
+                )
+            };
+            widest
+                .entry(id_of(&r.name))
+                .and_modify(|best| {
+                    if key(r) > key(best) {
+                        *best = r;
+                    }
+                })
+                .or_insert(r);
+        }
+        let widest_for_id = |id: u32| -> &MeasRec { widest.get(&id).copied().expect("id came from recs") };
 
         let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut count = 0usize;
@@ -1256,7 +1279,14 @@ impl ElfReader {
             let event_id = match reg.event_list.find_event(&r.event, 0) {
                 Some(e) => e.id,
                 None => {
-                    if !r.event.is_empty() {
+                    // Event 0 either way, but said out loud either way too. The warning used to be
+                    // conditional on the name being non-empty, which silenced the case that needs
+                    // it most: a descriptor with no event at all is bound to whichever event
+                    // happens to be 0, and is then sampled at that event's rate through a pointer
+                    // it never refreshes.
+                    if r.event.is_empty() {
+                        warn!("measurement '{}' names no event; binding it to event 0", r.name);
+                    } else {
                         warn!(
                             "measurement '{}' names event '{}', which is not in the ELF's event section; binding it to event 0",
                             r.name, r.event

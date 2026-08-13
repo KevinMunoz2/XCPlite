@@ -369,10 +369,13 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 // the live pointer, instead of the usual base+offset.
 // One addressing mode then covers globals, stack locals and heap/pointer
 // reachable data without a per-kind address extension, and there is no dynamic
-// base slot limit for pointer reachable objects. The command path
-// (SHORT_UPLOAD/DOWNLOAD/CALC_CHECKSUM) already resolves the application address
-// extension through ApplXcpReadMemory/ApplXcpWriteMemory, so only the DAQ path is
-// affected here.
+// base slot limit for pointer reachable objects. Only the DAQ path is affected
+// here: the command path (SHORT_UPLOAD/DOWNLOAD/CALC_CHECKSUM) routes the
+// application address extension to ApplXcpReadMemory/ApplXcpWriteMemory, which
+// resolve nothing on their own -- they answer CRC_ACCESS_DENIED unless the
+// application registers a callback. This used to read as though the command path
+// worked already; it works if and only if something registers one, which
+// mc-instrument now does for reads.
 #ifdef OPTION_ID_ADDRESSING
 #ifndef XCP_ENABLE_APP_ADDRESSING
 #error "OPTION_ID_ADDRESSING requires application addressing (identifiers travel on XCP_ADDR_EXT_APP)"
@@ -392,37 +395,12 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 #define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP
 #define XcpAddrIsId(addr_ext) ((addr_ext) == XCP_ADDR_EXT_ID)
 
-// The 32 bit address field is SPLIT, exactly as segment relative addressing splits it a few
-// lines above (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte
-// offset into it.
-//
-// It has to be split, because a master does arithmetic on ECU_ADDRESS and expects the result to
-// still mean something. Selecting element i of an array sends ECU_ADDRESS + i*elemsize, and any
-// object larger than XCP_MAX_ODT_ENTRY_SIZE must be split across ODT entries at addr, addr+248
-// and so on. With the whole word spent on a dense counter, id+k was another object's identifier:
-// such a request sampled an unrelated variable, or was refused as out of range, depending only
-// on how many signals the application happened to have.
-//
-// 16/16 mirrors the segment mode above: 65535 identifiers, 64 KiB per object -- the same ceiling
-// mc.hpp already imposes on a calibration segment.
-#ifndef XCP_ID_ADDR_LAYOUT_DEFINED
-#define XCP_ID_ADDR_LAYOUT_DEFINED
-// Layout of the 32 bit address field under identifier addressing: the identifier names the
-// object, the low bits are a byte offset into it. Split for the same reason segment relative
-// addressing splits it -- a master does arithmetic on ECU_ADDRESS (element i of an array is
-// ECU_ADDRESS + i*elemsize; an object wider than one ODT entry is armed as chunks at
-// ECU_ADDRESS + k*248) and the result has to keep meaning the same object.
-//
-// Defined in both this public header and src/xcp_cfg.h, behind one guard, because an
-// application that emits these addresses sees only this header while the server decodes them
-// from the other. The two must agree; the guard makes a double include safe, not a divergence.
-#define XCP_ID_OFFSET_BITS 16
-#define XCP_ID_OFFSET_MASK ((uint32_t)((1u << XCP_ID_OFFSET_BITS) - 1u))
-#define XCP_ID_MAX ((uint32_t)(0xFFFFFFFFu >> XCP_ID_OFFSET_BITS))
-#define XcpAddrEncodeId(id, offset) (uint32_t)((((uint32_t)(id)) << XCP_ID_OFFSET_BITS) | (((uint32_t)(offset)) & XCP_ID_OFFSET_MASK))
-#define XcpAddrDecodeId(addr) (uint32_t)(((uint32_t)(addr)) >> XCP_ID_OFFSET_BITS)
-#define XcpAddrDecodeIdOffset(addr) (uint32_t)(((uint32_t)(addr)) & XCP_ID_OFFSET_MASK)
-#endif // XCP_ID_ADDR_LAYOUT_DEFINED
+// The 32 bit address field is SPLIT, exactly as segment relative addressing splits it a few lines
+// above (XcpAddrEncodeSegIndex): the identifier names the object, the low bits are a byte offset
+// into it. The layout, and why it has to be split, live in one dependency-free header -- an
+// application sees only inc/xcplib.h and the server compiles against this file, so the definition
+// cannot sit in either.
+#include "xcp_id_addr.h"
 #endif // OPTION_ID_ADDRESSING
 
 // Static allocated memory for DAQ tables

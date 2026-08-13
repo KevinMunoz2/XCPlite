@@ -193,12 +193,16 @@ void XcpEventExtAt_Var(tXcpEventId event, uint64_t clock, int count, ...);
 // table[id].ptr directly. An entry whose ptr is NULL is sampled as zero (a
 // defined "not currently available"), so an armed but not yet live signal
 // produces no fault. Identifiers travel on the application address extension
-// (XCP_ADDR_EXT_APP). The command path (SHORT_UPLOAD / DOWNLOAD / CALC_CHECKSUM)
-// does NOT resolve them: the hook exists (ApplXcpReadMemory / ApplXcpWriteMemory)
-// but xcpappl.c's default returns CRC_ACCESS_DENIED and mc-instrument registers no
-// callback, so polling a signal without arming DAQ answers with an error. Only the
-// DAQ path is supported today. Identifier 0 is reserved as invalid; valid identifiers are
-// 1..count-1 and index the table directly.
+// (XCP_ADDR_EXT_APP). The command path resolves them only if the application
+// registers a resolver: ApplXcpReadMemory / ApplXcpWriteMemory reach
+// ApplXcpRegisterReadCallback / ApplXcpRegisterWriteCallback, and xcpappl.c's
+// default with no callback is CRC_ACCESS_DENIED. mc-instrument registers the READ
+// side over this same table, so SHORT_UPLOAD / UPLOAD / CALC_CHECKSUM of a
+// measurement work without arming DAQ; it deliberately registers no write side,
+// because a measurement has no reference page and no consistent-write discipline
+// (calibration goes through the segment mechanism, which has both).
+// Identifier 0 is reserved as invalid; valid identifiers are 1..count-1 and index
+// the table directly.
 #ifndef XCP_RESOLVE_ENTRY_DEFINED
 #define XCP_RESOLVE_ENTRY_DEFINED
 #define XCP_RESOLVE_SEG_NONE 0xFFFF
