@@ -377,6 +377,16 @@ XCPlite multi application absolute addressing: XCP_ADDRESS_MODE_XCPLITE__CXSDD (
 #ifndef XCP_ENABLE_APP_ADDRESSING
 #error "OPTION_ID_ADDRESSING requires application addressing (identifiers travel on XCP_ADDR_EXT_APP)"
 #endif
+// Per-ODT-entry address extensions, without which identifier addressing does not merely degrade --
+// it reads wild memory. The sampling loop's identifier branch is inside #ifdef
+// XCP_ENABLE_DAQ_ADDREXT (XcpTriggerDaqList_), because that is where the entry's extension is
+// available to test. With ADDREXT off the branch is not compiled, and the packed identifier in the
+// entry's address field falls through to the plain absolute path -- base[addr] -- so every sample
+// dereferences base + (id << 16). The build is clean and the failure is a wrong number or a
+// segfault, so say it here.
+#ifndef XCP_ENABLE_DAQ_ADDREXT
+#error "OPTION_ID_ADDRESSING requires XCP_ENABLE_DAQ_ADDREXT: the DAQ sampling loop can only recognise an identifier by the ODT entry's own address extension"
+#endif
 #define XCP_ENABLE_ID_ADDRESSING
 // Identifiers travel on the application address extension.
 #define XCP_ADDR_EXT_ID XCP_ADDR_EXT_APP

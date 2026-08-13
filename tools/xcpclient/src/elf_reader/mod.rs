@@ -1171,6 +1171,25 @@ impl ElfReader {
         // identifier 0 is reserved (invalid), so ids are 1-based.
         let id_of = |name: &str| -> u32 { (names.binary_search(&name).unwrap() as u32) + 1 };
 
+        // The identifier occupies the high 16 bits of the address field, so it has a ceiling, and
+        // exceeding it does not overflow into nothing -- `id << 16` drops the top bits and two
+        // distinct objects come out with the same ECU_ADDRESS. The A2L then describes one variable
+        // and the application resolves the other, with every value plausible. Refuse instead: the
+        // ceiling is a property of the addressing mode, not of this binary, and a user who hits it
+        // needs to hear the number.
+        if names.len() > XCP_ID_MAX as usize {
+            return Err(format!(
+                "{} distinct measurement names, but identifier addressing can only address {} \
+                 (the identifier is the high {} bits of a 32 bit address field, the low bits being \
+                 a byte offset into the object). Measure fewer objects, or raise \
+                 XCP_ID_OFFSET_BITS on both sides of the seam.",
+                names.len(),
+                XCP_ID_MAX,
+                32 - XCP_ID_OFFSET_BITS
+            )
+            .into());
+        }
+
         // When one name appears in several records, the runtime keeps the WIDEST of them
         // (`register_measurements` takes the max of type_size * x_dim), so the A2L has to
         // describe the same one or the master arms a width the application did not reserve.
@@ -1301,6 +1320,9 @@ const XCP_ADDR_EXT_APP: u8 = 0x80;
 /// How many low bits of the address field are a byte offset into the object the identifier names.
 /// Must equal XCP_ID_OFFSET_BITS in xcplite's xcp_cfg.h -- the server decodes what this encodes.
 const XCP_ID_OFFSET_BITS: u32 = 16;
+
+/// The largest identifier the field can hold, = XCP_ID_MAX in xcp_cfg.h / xcplib.h.
+const XCP_ID_MAX: u32 = u32::MAX >> XCP_ID_OFFSET_BITS;
 
 /// Map an A2L type id (tA2lTypeId in a2l.h: magnitude = byte size, sign = signedness) to the
 /// registry value type. mc-instrument measures `bool` as UINT8, so it arrives here as +1.
