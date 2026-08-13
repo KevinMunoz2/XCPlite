@@ -743,7 +743,7 @@ async fn xcp_client(
                 );
 
                 // Get the EPK string and address from debug_data and set it in the registry application version information, if available
-                elf_reader.register_epk_addr_info(&mut reg, verbose);
+                elf_reader.register_epk_addr_info(&mut reg, segment_relative, verbose);
 
                 // Register events from event creation markers (evt__name) in the code
                 elf_reader.register_events(&mut reg, verbose)?;

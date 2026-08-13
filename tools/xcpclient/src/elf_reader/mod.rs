@@ -209,14 +209,41 @@ impl ElfReader {
         return None;
     }
 
-    // Get the EPK string and address from debug_data and set it in the registry application version information, if available
-    pub fn register_epk_addr_info(&self, reg: &mut Registry, verbose: usize) {
+    /// Register the EPK string and the address a master must read it from.
+    ///
+    /// The A2L's `ADDR_EPK` is a *protocol* address, not the ELF address of the string. A master
+    /// that verifies the A2L against the ECU (CANape does, on going online) issues
+    /// `SET_MTA(ADDR_EPK)` + `UPLOAD`, and xcplite serves the EPK from exactly one place:
+    ///
+    ///   * with an EPK calibration segment and `XCP_ADDR_EXT_SEG == 0` -- what mc-instrument builds
+    ///     -- segment 0 offset 0, i.e. `XcpAddrEncodeSegIndex(0, 0)` = `0x80000000`;
+    ///   * otherwise the reserved absolute address `0xFFFFFF00`, which `XcpSetMta` special-cases.
+    ///
+    /// Writing the ELF address instead is what the runtime A2L never did and this route always did.
+    /// The consequence is not subtle and it is not visible to our own kernel pipeline, which never
+    /// reads the EPK: CANape sends `SET_MTA addrext=0 addr=<elf addr>`, xcplite finds an address
+    /// below 0x80000000 on the segment extension, warns that it is "converting to ABS addressing
+    /// mode", reads whatever that offset means from the module base, and answers `ERR 0x24`
+    /// (access denied). CANape reports "Error message from ECU! The memory location is not
+    /// accessible (UPLOAD,24H)" and refuses to switch the device online. The application is
+    /// perfectly measurable and completely unusable.
+    ///
+    /// See `xcplite.c:626` and `xcp_cfg.h:238-266`.
+    pub fn register_epk_addr_info(&self, reg: &mut Registry, segment_relative: bool, verbose: usize) {
         info!("===============================================================");
         if self.debug_data.epk_addr > 0 {
-            info!("EPK segment memory section found at address = 0x{:08X}", self.debug_data.epk_addr);
             let epk = self.debug_data.epk_string.clone().unwrap_or_else(|| "<unknown>".to_string());
+            // XCP_ADDR_EPK for the two addressing schemes this reader can be given. The EPK
+            // segment always has index 0 (`register_segments` forces it), so the offset is 0.
+            const XCP_ADDR_EPK_SEG: u32 = 0x8000_0000;
+            const XCP_ADDR_EPK_ABS: u32 = 0xFFFF_FF00;
+            let epk_addr = if segment_relative { XCP_ADDR_EPK_SEG } else { XCP_ADDR_EPK_ABS };
             info!("EPK string: '{}'", epk);
-            reg.application.set_version(epk, self.debug_data.epk_addr.try_into().unwrap());
+            info!(
+                "EPK section is at 0x{:08X} in the ELF; ADDR_EPK is the protocol address 0x{:08X}, which is where xcplite serves it",
+                self.debug_data.epk_addr, epk_addr
+            );
+            reg.application.set_version(epk, epk_addr);
         } else {
             warn!("EPK segment memory section not found in ELF file");
         }
