@@ -127,11 +127,20 @@
 // Maximum number of DAQ events (integer value, must be even)
 // Needs OPTION_DAQ_EVENT_COUNT*2 bytes of memory
 // If OPTION_DAQ_EVENT_LIST is off, event number is bound which is used for optimization
+// Guarded, so an application whose event count this default does not fit can raise it from its
+// build rather than by editing this file. 16 is a handful of MEASURE sites, which an application
+// of any size passes without meaning to.
+#ifndef OPTION_DAQ_EVENT_COUNT
 #define OPTION_DAQ_EVENT_COUNT (16)
+#endif
 
 // Memory bytes used for XCP DAQ tables
 // 6 bytes per measurement signal (ODT entry) needed
+// Guarded for the same reason as the event count: it bounds how many signals can be armed at
+// once, and an application only finds out by running out.
+#ifndef OPTION_DAQ_MEM_SIZE
 #define OPTION_DAQ_MEM_SIZE (512 * 6)
+#endif
 
 // Create an cyclic DAQ event for asynchronous data acquisition
 // #define OPTION_DAQ_ASYNC_EVENT

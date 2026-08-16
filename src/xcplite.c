@@ -967,7 +967,17 @@ static uint16_t XcpRegisterSectionEvents(void) {
             tXcpEventId id = XcpFindEvent(e->name);
             if (id == XCP_UNDEFINED_EVENT_ID) {
                 id = XcpCreateEvent(e->name, e->cycle_time_ns, e->priority);
-                assert(id != XCP_UNDEFINED_EVENT_ID);
+                // Not an assert. The events in this section are declared by the application, so
+                // running out of room for them is a configuration the developer can fix -- and an
+                // assert says so only in a build that has them enabled, then aborts. With NDEBUG
+                // it said nothing at all and left the event undefined, which is the worse half:
+                // the signals bound to it are simply absent from a server that started normally.
+                if (id == XCP_UNDEFINED_EVENT_ID) {
+                    DBG_PRINTF_ERROR("event '%s' could not be created: the limit of %u events is reached, so this event and every "
+                                     "measurement bound to it will be missing. Raise OPTION_DAQ_EVENT_COUNT.\n",
+                                     e->name, (unsigned)XCP_MAX_EVENT_COUNT);
+                    continue;
+                }
                 count++;
             }
         }
