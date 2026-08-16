@@ -272,12 +272,23 @@ impl ElfReader {
                 } else {
                     (var_name.strip_prefix("calblk__").unwrap_or(var_name), None)
                 };
-                let mut seg_descr_addr = var_infos[0].address.1;
+                // One marker, one segment. Where the debug info still reports the same marker
+                // more than once, take the entry that has an address rather than the first:
+                // a marker without one contributes 0, and segment numbers come from sorting on
+                // this address, so a 0 would silently renumber every segment after it. Asserting
+                // here used to abort the whole A2L generation over debug info that is perfectly
+                // legal -- a hard stop on a valid program is never the right answer for a
+                // generator.
+                let var_info = var_infos.iter().find(|info| info.address.1 != 0).unwrap_or(&var_infos[0]);
+                let mut seg_descr_addr = var_info.address.1;
                 if seg_name == "epk" {
                     // EPK segment is a special case, it has always index = 0
                     seg_descr_addr = 0;
+                } else if seg_descr_addr == 0 {
+                    log::warn!(
+                        "Calibration segment marker '{var_name}' has no address in the debug info. Segment numbering is taken from marker                          addresses, so this segment may be numbered wrongly. Declare the marker with external linkage so the compiler emits                          a location for it."
+                    );
                 }
-                assert!(var_infos.len() == 1);
                 seg_definitions.push((seg_name.to_string(), var_infos, seg_descr_addr, seg_number));
             }
         }

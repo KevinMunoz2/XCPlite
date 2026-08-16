@@ -20,7 +20,7 @@ use crate::elf_reader::debuginfo::cfa::{CfaInfo, get_cfa_from_object};
 use crate::elf_reader::debuginfo::{DbgDataType, DebugData, TypeInfo, VarInfo};
 
 mod attributes;
-use attributes::{get_abstract_origin_attribute, get_location_attribute, get_name_attribute, get_specification_attribute, get_typeref_attribute};
+use attributes::{get_abstract_origin_attribute, get_attr_value, get_location_attribute, get_name_attribute, get_specification_attribute, get_typeref_attribute};
 
 mod typereader;
 
@@ -356,6 +356,9 @@ impl DebugDataReader<'_> {
             // traverse all entries in depth-first order
             let mut depth = 0;
             let mut context: Vec<(gimli::DwTag, Option<String>)> = Vec::new();
+            // Where each variable DIE of this unit ended up, so that a later definition DIE can
+            // find the declaration it completes. Unit-relative offsets, so it is per unit.
+            let mut declared: HashMap<gimli::UnitOffset, (String, usize)> = HashMap::new();
             while let Ok(Some((depth_delta, entry))) = entries_cursor.next_dfs() {
                 depth += depth_delta;
                 debug_assert!(depth >= 1);
@@ -372,17 +375,48 @@ impl DebugDataReader<'_> {
                 debug_assert_eq!(depth as usize, context.len());
 
                 if entry.tag() == gimli::constants::DW_TAG_variable {
+                    // A definition DIE carrying DW_AT_specification is the *same* variable as the
+                    // declaration it points at, not a second one. gcc splits a variable declared
+                    // inside a namespace exactly that way: the declaration sits in the
+                    // DW_TAG_namespace chain and carries the namespaces, the definition sits at
+                    // compilation-unit level and carries the address. Pushing both reports one
+                    // variable twice -- once with its namespaces and no address, once with an
+                    // address and no namespaces -- and callers that expect one entry per name
+                    // (register_segments, and the segment ordering that follows it) see two.
+                    let specification = match get_attr_value(entry, gimli::constants::DW_AT_specification) {
+                        Some(gimli::AttributeValue::UnitRef(offset)) => Some(offset),
+                        _ => None,
+                    };
+                    let entry_offset = entry.offset();
                     // Get variable information
                     match self.get_variable(entry, unit, abbreviations) {
                         Ok((name, typeref, address)) => {
-                            let (function, namespaces) = get_varinfo_from_context(&context);
-                            variables.entry(name).or_default().push(VarInfo {
-                                address, // may be 0 for local variables
-                                typeref,
-                                unit_idx,
-                                function,
-                                namespaces,
-                            });
+                            let merged = match specification.and_then(|offset| declared.get(&offset)) {
+                                Some((declared_name, index)) => variables
+                                    .get_mut(declared_name.as_str())
+                                    .and_then(|infos| infos.get_mut(*index))
+                                    .map(|info| {
+                                        // Take what the declaration could not carry, and keep what
+                                        // only it knows: the namespaces it was written in.
+                                        if info.address.1 == 0 {
+                                            info.address = address;
+                                        }
+                                    })
+                                    .is_some(),
+                                None => false,
+                            };
+                            if !merged {
+                                let (function, namespaces) = get_varinfo_from_context(&context);
+                                let infos = variables.entry(name.clone()).or_default();
+                                declared.insert(entry_offset, (name, infos.len()));
+                                infos.push(VarInfo {
+                                    address, // may be 0 for local variables
+                                    typeref,
+                                    unit_idx,
+                                    function,
+                                    namespaces,
+                                });
+                            }
                         }
                         Err(errmsg) => {
                             if self.verbose > 0 {
