@@ -1680,6 +1680,24 @@ impl ElfReader {
             if record.is_empty() {
                 continue;
             }
+            // A record with no field name describes the type itself, not a field of it. It goes
+            // on the INSTANCE of every segment of that type -- which is the only place an A2L
+            // will take it: TYPEDEF_STRUCTURE's description is written as "" by the registry's
+            // A2L writer with no way to set it.
+            if record.field.is_empty() {
+                for (segment, root) in &segments {
+                    if root.name.as_deref() != Some(record.owner.as_str()) {
+                        continue;
+                    }
+                    if let Some(inst) = reg.instance_list.get_instance_mut(segment, None) {
+                        inst.mc_support_data.update_comment(record.comment.clone());
+                        if verbose >= 1 {
+                            info!("  Description applied to segment instance '{}': '{}'", segment, record.comment);
+                        }
+                    }
+                }
+                continue;
+            }
             let mut applied = 0;
             for (segment, root) in &segments {
                 // Where inside this segment a struct of the declaring type sits. Usually nowhere
