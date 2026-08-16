@@ -40,6 +40,7 @@ struct DebugDataReader<'elffile> {
     epk_addr: u64,
     xcp_meta_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes)
     mci_meta_data: Option<Vec<u8>>,        // raw bytes of the mci_meta section (mc-instrument calibration metadata)
+    mci_app_name: Option<String>,          // the application's own name, from the mci_app section
     mci_meas_data: Option<(u64, Vec<u8>)>, // (section_base_addr, raw_bytes) of mci_meas (mc-instrument measurement descriptors)
     mci_layout_data: Option<Vec<u8>>,      // raw bytes of mci_layout: how to parse an mci_meas record on this ABI
     rodata_data: Option<(u64, Vec<u8>)>,   // (section_base_addr, raw_bytes) of .rodata, used to resolve string pointers held in mci_meas
@@ -109,6 +110,19 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
     } else {
         log::debug!("mc-instrument calibration metadata section (mci_meta) not found in ELF file");
     }
+    // read the mci_app section: the application's own name, as characters. The runtime A2L route
+    // takes it from the same Cfg the server is started with; without this the offline route had
+    // nothing to call the project but a placeholder.
+    let mci_app_name: Option<String> = elffile
+        .section_by_name("mci_app")
+        .and_then(|s| s.data().ok())
+        .map(|data| String::from_utf8_lossy(data).trim_end_matches('\0').trim().to_string())
+        .filter(|name| !name.is_empty());
+    if let Some(ref name) = mci_app_name {
+        log::info!("mc-instrument application name section (mci_app) found: '{}'", name);
+    } else {
+        log::debug!("mc-instrument application name section (mci_app) not found in ELF file");
+    }
     // read the mci_meas section: mc-instrument's measurement descriptors (a packed array of
     // MeasMeta records). Keep the section base address; the records hold absolute pointers into
     // .rodata for their name/comment/unit strings, so the reader needs .rodata too to resolve them.
@@ -170,6 +184,7 @@ pub(crate) fn load_elf_dwarf(filename: &OsStr, verbose: usize, unit_idx_limit: u
         epk_addr,
         xcp_meta_data,
         mci_meta_data,
+        mci_app_name,
         mci_meas_data,
         mci_layout_data,
         rodata_data,
@@ -301,6 +316,7 @@ impl DebugDataReader<'_> {
             epk_addr: self.epk_addr,
             xcp_meta_data: self.xcp_meta_data,
             mci_meta_data: self.mci_meta_data,
+            mci_app_name: self.mci_app_name,
             mci_meas_data: self.mci_meas_data,
             mci_layout_data: self.mci_layout_data,
             rodata_data: self.rodata_data,

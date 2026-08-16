@@ -86,6 +86,13 @@ pub(crate) struct ElfReader {
 }
 
 impl ElfReader {
+    /// The application's own name, as MC_APP declared it, or None when the ELF does not carry
+    /// one. Used for the A2L's PROJECT and MODULE, which otherwise fall back to a placeholder
+    /// that is the same for every application and so cannot tell two of them apart.
+    pub fn app_name(&self) -> Option<&str> {
+        self.debug_data.mci_app_name.as_deref()
+    }
+
     // Load debug information from the ELF file
     pub fn new(file_name: &str, verbose: usize, unit_idx_limit: usize) -> Option<ElfReader> {
         info!("Loading debug information from ELF file: {}", file_name);

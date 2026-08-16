@@ -768,6 +768,14 @@ async fn xcp_client(
                     elf_reader.register_cal_metadata(&mut reg, verbose)?;
                     // Register identifier-addressed measurements from the mci_meas descriptor section
                     elf_reader.register_mci_measurements(&mut reg, verbose)?;
+                    // The application's own name, when it carries one, becomes the A2L's PROJECT
+                    // and MODULE. An explicit --ecu-name still wins; the placeholder no longer
+                    // has to, which is what made two offline A2Ls indistinguishable.
+                    if ecu_name.is_empty()
+                        && let Some(name) = elf_reader.app_name()
+                    {
+                        ecu_name = name.to_string();
+                    }
                 }
             }
 
