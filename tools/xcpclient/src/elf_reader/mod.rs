@@ -654,6 +654,16 @@ impl ElfReader {
             }
         };
 
+        // The reference pages of the declared calibration segments. The compilation unit filter
+        // narrows the sweep of *incidental* variables -- without it the A2L also describes the
+        // XCP server's own internals -- but a calibration segment is not incidental: it was
+        // declared, register_segments has already created it, and its objects are what the A2L
+        // is being generated for. Filtering its page out left the segment in the registry with
+        // no INSTANCE and no TYPEDEF_STRUCTURE behind it, so the A2L came out with every
+        // measurement, no calibration at all, and a dangling SUB_GROUP -- reported as a warning
+        // on a run that still exited successfully.
+        let calseg_pages: std::collections::HashSet<String> = self.calseg_roots().into_iter().map(|(name, _)| name).collect();
+
         // Compile compilation unit filter regex if specified
         let unit_regex: Option<Regex> = if unit_filter.is_empty() {
             None
@@ -732,8 +742,10 @@ impl ElfReader {
                     continue;
                 }
 
-                // Apply compilation unit filter
-                if let Some(ref re) = unit_regex {
+                // Apply compilation unit filter, except to a calibration segment's reference page
+                if let Some(ref re) = unit_regex
+                    && !calseg_pages.contains(var_name)
+                {
                     let cu_name = self.debug_data.make_simple_unit_name(var_info.unit_idx).unwrap_or_else(|| format!("{}", var_info.unit_idx));
                     if !re.is_match(&cu_name) {
                         continue;
